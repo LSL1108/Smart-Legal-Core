@@ -58,12 +58,6 @@ Integrated with **Ollama (Qwen2.5)** and **BGE-M3**, supporting fully local exec
 
 ---
 
-## 📅 開發背景 | Development Background
-[cite_start]此專案結合了我在 **國科會 (NSTC)** 研究計畫中對區塊鏈/分散式系統的嚴謹邏輯 ，以及於 **全球人壽 (TransGlobe Life)** 數位發展部實習期間對金融合約自動化的實務洞察。
-[cite_start]This project combines the rigorous logic of blockchain systems from my **NSTC** research  with practical insights into FinTech automation gained during my internship at **TransGlobe Life's** Digital Development Department.
-
----
-
 ## 📫 聯絡我 | Contact
 - [cite_start]**Name**: Sheng-Lun Lin (林聖倫) [cite: 63]
 - [cite_start]**Email**: q26221922@gmail.com [cite: 47]
