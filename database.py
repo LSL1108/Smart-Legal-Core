@@ -3,13 +3,15 @@ import sqlite3
 import json
 import logging
 import datetime
+import hashlib
 from contextlib import contextmanager
-from typing import Dict, Any, List, Optional
-
+from typing import Dict, Any, List, Optional, Tuple
+import re
+from difflib import SequenceMatcher
 import chromadb
 from chromadb.utils import embedding_functions
-from utils import detect_topics
-from config import SQLITE_DB_PATH, CHROMA_DIR, EMBED_MODEL
+from utils import detect_topics, parse_core_topics_field, detect_clause_type, normalize_text
+from config import SQLITE_DB_PATH, CHROMA_DIR, EMBED_MODEL, TOPIC_KEYWORDS, TOPIC_ALIAS
 
 # ★ 預設法遵規則庫 
 DEFAULT_COMPLIANCE_RULES: Dict[str, List[str]] = {
@@ -35,7 +37,127 @@ DEFAULT_COMPLIANCE_RULES: Dict[str, List[str]] = {
         "廠商應於規定期限內完成弱點修補",
         "廠商應提供免費修補服務",
     ],
+    "代理人資格": [
+        "保險代理人應具備保險代理人執業證照及相關法定資格",
+        "從事招攬行為之人員應具備保險業務員資格",
+    ],
+    "授權範圍": [
+        "保險代理人之授權事項應以書面明確約定，不得以口頭同意擴張服務範圍",
+    ],
+    "文件轉送期限": [
+        "保險代理人收受要保文件後，應於約定期限內轉送保險業核辦",
+    ],
+    "廣告文宣控管": [
+        "保險商品廣告、文宣、簡報及商品說明資料應經保險業事前書面同意後始得使用",
+    ],
+    "個人資料保護": [
+        "保險代理人處理保戶、要保人或被保險人個人資料時，應採取安全維護措施並接受保險業監督",
+    ],
+    "複委託監督": [
+        "保險代理人複委託第三人處理資料或服務事項時，應取得保險業事前書面同意並負同等責任",
+    ],
+    "洗錢防制與打擊資恐": [
+        "保險代理人應配合保險業辦理客戶身分確認、風險辨識、資料驗證及洗錢防制與打擊資恐作業",
+    ],
+    "終止事由": [
+        "保險代理人有證照撤銷、主管機關重大裁罰、重大違反保險法令或損害保戶權益情事時，保險業得暫停或終止合約",
+    ],
 }
+# === Topic Filter Helper Functions ===
+
+_TOPIC_FILTER_MIN_MATCH = 1
+
+
+def _topic_filter_terms(target_topic: str) -> List[str]:
+    """取得 target_topic 對應的 topic、alias、keywords，用於 RAG chunk topic guard。"""
+    target_topic = str(target_topic or "").strip()
+    if not target_topic:
+        return []
+
+    terms: List[str] = [target_topic]
+    terms.extend(TOPIC_ALIAS.get(target_topic, []))
+    terms.extend(TOPIC_KEYWORDS.get(target_topic, []))
+
+    seen = set()
+    normalized_terms: List[str] = []
+    for term in terms:
+        t = normalize_text(str(term or "").strip())
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        normalized_terms.append(t)
+    return normalized_terms
+
+
+def _ref_topic_text(ref: Dict[str, Any]) -> str:
+    """彙整 chunk metadata 與內容中可判斷 topic 的文字。"""
+    parts: List[str] = []
+    for key in ["topics", "core_topics"]:
+        value = ref.get(key, "")
+        if isinstance(value, list):
+            parts.extend(str(v) for v in value)
+        else:
+            parts.append(str(value or ""))
+
+    for key in [
+        "topics_text",
+        "article_title",
+        "clause_type",
+        "chunk_label",
+        "content",
+    ]:
+        parts.append(str(ref.get(key, "") or ""))
+
+    return normalize_text(" ".join(parts))
+
+
+def _topic_match_score(ref: Dict[str, Any], target_topic: str) -> int:
+    """計算 chunk 是否與指定 topic 相符。metadata topic 命中給較高權重。"""
+    terms = _topic_filter_terms(target_topic)
+    if not terms:
+        return 0
+
+    score = 0
+    topic_fields = normalize_text(" ".join([
+        str(ref.get("topics_text", "") or ""),
+        " ".join(ref.get("topics", []) if isinstance(ref.get("topics"), list) else [str(ref.get("topics", ""))]),
+        " ".join(ref.get("core_topics", []) if isinstance(ref.get("core_topics"), list) else [str(ref.get("core_topics", ""))]),
+        str(ref.get("article_title", "") or ""),
+        str(ref.get("clause_type", "") or ""),
+        str(ref.get("chunk_label", "") or ""),
+    ]))
+    full_text = _ref_topic_text(ref)
+
+    for term in terms:
+        if term in topic_fields:
+            score += 3
+        elif term in full_text:
+            score += 1
+    return score
+
+
+def filter_chunks_by_topic(refs: List[Dict[str, Any]], target_topic: str) -> List[Dict[str, Any]]:
+    """
+    依 target_topic 優先篩選 RAG 片段。
+
+    目的：避免「文件對了、條文錯了」，例如缺漏保密措施卻引用到招攬義務。
+    若完全沒有命中，保留原 refs 作為 fallback，避免因 topic metadata 不完整而查不到資料。
+    """
+    target_topic = str(target_topic or "").strip()
+    if not refs or not target_topic:
+        return refs
+
+    scored: List[Tuple[int, Dict[str, Any]]] = []
+    for ref in refs:
+        score = _topic_match_score(ref, target_topic)
+        if score >= _TOPIC_FILTER_MIN_MATCH:
+            scored.append((score, ref))
+
+    if not scored:
+        return refs
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [ref for _, ref in scored]
 
 
 # Connection
@@ -478,9 +600,224 @@ if not os.environ.get("SKIP_DB_INIT"):
     ensure_db()
 
 
+
+# === Chunk Helper Functions ===
+
+def _stable_chunk_id(doc_id: str, parent_article_key: str, chunk_index: int, content: str) -> str:
+    """產生穩定 chunk id，避免同一文件重建索引時追蹤來源失準。"""
+    seed = "\n".join([
+        str(doc_id or ""),
+        str(parent_article_key or ""),
+        str(chunk_index),
+        normalize_text(content or ""),
+    ])
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+    return f"{doc_id}_chunk_{digest}"
+
+
+def _metadata_str(value: Any) -> str:
+    """Chroma metadata 僅存純量；此函式統一轉成安全字串。"""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(x).strip() for x in value if str(x).strip())
+    return str(value).strip()
+
+
+def _normalize_topics_value(value: Any, content: str = "") -> List[str]:
+    if isinstance(value, list):
+        topics = [str(t).strip() for t in value if str(t).strip()]
+    else:
+        topics = parse_core_topics_field(value)
+
+    if not topics:
+        topics = detect_topics(content)
+
+    seen = set()
+    normalized: List[str] = []
+    for topic in topics:
+        t = str(topic).strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        normalized.append(t)
+    return normalized
+
+
+def _chunk_display_label(metadata: Dict[str, Any]) -> str:
+    article_no = _metadata_str(metadata.get("article_no"))
+    article_title = _metadata_str(metadata.get("article_title"))
+    chunk_index = metadata.get("chunk_index", 0)
+
+    parts = []
+    if article_no:
+        parts.append(article_no)
+    if article_title:
+        parts.append(article_title)
+    if chunk_index not in [None, "", 0, "0"]:
+        parts.append(f"片段{chunk_index}")
+    return "｜".join(parts) if parts else "未標示條文"
+
+
+# === Deduplication & MMR Helper Functions ===
+
+_DEDUP_HIGH_SIMILARITY_THRESHOLD = 0.98
+
+
+def _normalize_text_for_dedup(text: str) -> str:
+    """供去重使用：壓縮空白與換行，避免同一段文字因格式差異被視為不同。"""
+    return " ".join(normalize_text(text or "").split())
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """兩段文字相似度，供高相似度去重與 MMR 使用。"""
+    a = _normalize_text_for_dedup(a)
+    b = _normalize_text_for_dedup(b)
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _ref_dedup_key(ref: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """以文件、條文、片段與內容摘要作為去重基礎。"""
+    return (
+        str(ref.get("doc_id", "")),
+        str(ref.get("parent_article_key", "")),
+        str(ref.get("chunk_index", "")),
+        _normalize_text_for_dedup(ref.get("content", ""))[:120],
+    )
+
+
+def _dedup_chunk_refs(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    移除重複或幾乎相同的檢索片段。
+
+    目的：避免同一條歷史合約因向量檢索與 keyword fallback 同時命中，
+    造成後續 LLM 看到大量重複 context，進而放大單一來源的影響。
+    """
+    seen_keys = set()
+    kept: List[Dict[str, Any]] = []
+    seen_hashes = set()
+
+    for ref in refs:
+        content = str(ref.get("content", "") or "").strip()
+        if not content:
+            continue
+
+        key = _ref_dedup_key(ref)
+        if key in seen_keys:
+            continue
+
+        norm = _normalize_text_for_dedup(content)
+        content_hash = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+        if content_hash in seen_hashes:
+            continue
+
+        too_similar = False
+        for existing in kept:
+            if _text_similarity(content, existing.get("content", "")) >= _DEDUP_HIGH_SIMILARITY_THRESHOLD:
+                too_similar = True
+                break
+        if too_similar:
+            continue
+
+        seen_keys.add(key)
+        seen_hashes.add(content_hash)
+        kept.append(ref)
+
+    return kept
+
+
+def _metadata_relevance_bonus(ref: Dict[str, Any], keywords: List[str]) -> int:
+    """根據條文標題、主題、條款類型、chunk_label 給額外分數。"""
+    if not keywords:
+        return 0
+
+    topic_text = normalize_text(" ".join(ref.get("topics", []) if isinstance(ref.get("topics"), list) else [str(ref.get("topics", ""))]))
+    core_topic_text = normalize_text(" ".join(ref.get("core_topics", []) if isinstance(ref.get("core_topics"), list) else [str(ref.get("core_topics", ""))]))
+    title_text = normalize_text(str(ref.get("article_title", "")))
+    clause_type_text = normalize_text(str(ref.get("clause_type", "")))
+    label_text = normalize_text(str(ref.get("chunk_label", "")))
+
+    bonus = 0
+    for kw in keywords:
+        if kw in title_text or kw in label_text:
+            bonus += 2
+        if kw in topic_text or kw in core_topic_text or kw in clause_type_text:
+            bonus += 3
+    return bonus
+
+
+def _mmr_select_refs(
+    refs: List[Dict[str, Any]],
+    *,
+    keywords: List[str],
+    top_n: int,
+    lambda_: float = 0.65,
+) -> List[Dict[str, Any]]:
+    """
+    用簡化版 MMR 從檢索結果中挑出兼具相關性與多樣性的片段。
+
+    relevance 來源：
+    1. 既有檢索順序越前面分數越高；
+    2. 內容、條文標題、主題、條款類型命中關鍵詞會加分。
+    diversity 來源：
+    與已選片段文字越相似，越降低排序。
+    """
+    if not refs or top_n <= 0:
+        return []
+
+    refs = _dedup_chunk_refs(refs)
+    if len(refs) <= top_n:
+        return refs[:top_n]
+
+    lambda_ = max(0.0, min(1.0, lambda_))
+    texts = [str(ref.get("content", "") or "") for ref in refs]
+    base_scores: List[float] = []
+    total = max(len(refs), 1)
+
+    for idx, ref in enumerate(refs):
+        order_score = (total - idx) / total
+        norm_content = normalize_text(texts[idx])
+        keyword_hits = sum(1 for kw in keywords if kw and kw in norm_content)
+        meta_bonus = _metadata_relevance_bonus(ref, keywords)
+        base_scores.append(order_score + keyword_hits * 0.15 + meta_bonus * 0.2)
+
+    min_s, max_s = min(base_scores), max(base_scores)
+    if max_s > min_s:
+        relevance = [(s - min_s) / (max_s - min_s) for s in base_scores]
+    else:
+        relevance = [1.0 for _ in base_scores]
+
+    selected: List[int] = []
+    remaining = list(range(len(refs)))
+
+    first = max(remaining, key=lambda i: relevance[i])
+    selected.append(first)
+    remaining.remove(first)
+
+    while len(selected) < top_n and remaining:
+        best_i = remaining[0]
+        best_score = -999.0
+        for i in remaining:
+            max_sim = max(_text_similarity(texts[i], texts[j]) for j in selected) if selected else 0.0
+            mmr_score = lambda_ * relevance[i] - (1.0 - lambda_) * max_sim
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best_i = i
+        selected.append(best_i)
+        remaining.remove(best_i)
+
+    return [refs[i] for i in selected]
+
 # Vector DB Operations
 
-def upsert_template_vectors(meta: Dict[str, Any], full_text: str, chunks: List[str]):
+def upsert_template_vectors(meta: Dict[str, Any], full_text: str, chunks: List[Any]):
+    """
+    支援兩種 chunks 格式：
+    1. 舊版 List[str]
+    2. 新版 article-aware List[Dict[str, Any]]
+    """
     ensure_db()
     try:
         template_collection.upsert(
@@ -491,7 +828,7 @@ def upsert_template_vectors(meta: Dict[str, Any], full_text: str, chunks: List[s
                 "file_name":        meta["file_name"],
                 "contract_type":    meta.get("contract_type", "其他"),
                 "summary":          meta.get("summary", ""),
-                "keywords":         ",".join(meta.get("keywords",    [])),
+                "keywords":         ",".join(meta.get("keywords", [])),
                 "core_topics":      ",".join(meta.get("core_topics", [])),
                 "vendor_name":      meta.get("vendor_name", ""),
                 "system_name":      meta.get("system_name", ""),
@@ -507,20 +844,104 @@ def upsert_template_vectors(meta: Dict[str, Any], full_text: str, chunks: List[s
     if not chunks:
         return
 
+    normalized_chunks: List[Dict[str, Any]] = []
+    for i, chunk in enumerate(chunks):
+        if isinstance(chunk, dict):
+            content = str(chunk.get("content", "") or "").strip()
+            if not content:
+                continue
+
+            topics_val = chunk.get("topics", [])
+            if isinstance(topics_val, list):
+                topics = [str(t).strip() for t in topics_val if str(t).strip()]
+            else:
+                topics = parse_core_topics_field(topics_val)
+
+            if not topics:
+                topics = detect_topics(content)
+
+            article_title = str(chunk.get("article_title", "") or chunk.get("title", "") or "")
+            clause_type = str(chunk.get("clause_type", "") or "").strip()
+            if not clause_type:
+                clause_type = detect_clause_type(content, article_title)
+
+            article_no = _metadata_str(chunk.get("article_no"))
+            article_title = _metadata_str(article_title)
+            parent_article_key = _metadata_str(chunk.get("parent_article_key")) or article_no or f"ARTICLE_{i}"
+            chunk_index = int(chunk.get("chunk_index", i) or 0)
+
+            metadata = {
+                "doc_id": meta["doc_id"],
+                "file_name": meta["file_name"],
+                "contract_type": meta.get("contract_type", "其他"),
+                "template_role": meta.get("template_role", "歷史基準與規範"),
+                "topics": ",".join(topics),
+                "core_topics": ",".join(meta.get("core_topics", [])),
+                "article_no": article_no,
+                "article_title": article_title,
+                "chunk_index": chunk_index,
+                "parent_article_key": parent_article_key,
+                "clause_type": clause_type,
+                "vendor_name": meta.get("vendor_name", ""),
+                "system_name": meta.get("system_name", ""),
+                "service_scope": meta.get("service_scope", ""),
+                "maintenance_type": meta.get("maintenance_type", ""),
+                "industry": meta.get("industry", ""),
+                "contract_name": meta.get("contract_name", ""),
+            }
+            metadata["chunk_label"] = _chunk_display_label(metadata)
+
+            normalized_chunks.append({
+                "id": _stable_chunk_id(meta["doc_id"], parent_article_key, chunk_index, content),
+                "content": content,
+                "metadata": metadata,
+            })
+        else:
+            content = str(chunk or "").strip()
+            if not content:
+                continue
+
+            clause_type = detect_clause_type(content, "")
+
+            topics = detect_topics(content)
+            metadata = {
+                "doc_id": meta["doc_id"],
+                "file_name": meta["file_name"],
+                "contract_type": meta.get("contract_type", "其他"),
+                "template_role": meta.get("template_role", "歷史基準與規範"),
+                "topics": ",".join(topics),
+                "core_topics": ",".join(meta.get("core_topics", [])),
+                "article_no": "",
+                "article_title": "",
+                "chunk_index": i,
+                "parent_article_key": f"ARTICLE_{i}",
+                "clause_type": clause_type,
+                "vendor_name": meta.get("vendor_name", ""),
+                "system_name": meta.get("system_name", ""),
+                "service_scope": meta.get("service_scope", ""),
+                "maintenance_type": meta.get("maintenance_type", ""),
+                "industry": meta.get("industry", ""),
+                "contract_name": meta.get("contract_name", ""),
+            }
+            metadata["chunk_label"] = _chunk_display_label(metadata)
+
+            normalized_chunks.append({
+                "id": _stable_chunk_id(meta["doc_id"], metadata["parent_article_key"], i, content),
+                "content": content,
+                "metadata": metadata,
+            })
+
+    if not normalized_chunks:
+        return
+
     try:
         chunk_collection.upsert(
-            ids=[f"{meta['doc_id']}_chunk_{i}" for i in range(len(chunks))],
-            documents=chunks,
-            metadatas=[{
-                "doc_id":        meta["doc_id"],
-                "file_name":     meta["file_name"],
-                "contract_type": meta.get("contract_type", "其他"),
-                "topics":        ",".join(detect_topics(chunk)),
-            } for chunk in chunks],
+            ids=[x["id"] for x in normalized_chunks],
+            documents=[x["content"] for x in normalized_chunks],
+            metadatas=[x["metadata"] for x in normalized_chunks],
         )
     except Exception as e:
         logging.error("歷史基準片段向量入庫失敗: %s", e)
-
 
 def query_templates_fulltext(draft_text: str, n_results: int = 12) -> List[Dict[str, Any]]:
     ensure_db()
@@ -564,38 +985,145 @@ def query_templates_fulltext(draft_text: str, n_results: int = 12) -> List[Dict[
 
 
 def query_template_chunks_by_query(
-    query_text: str, candidate_doc_ids: List[str], n_results: int = 12
+    query_text: str,
+    candidate_doc_ids: List[str],
+    n_results: int = 12,
+    target_topic: str = "",
 ) -> List[Dict[str, Any]]:
     if not candidate_doc_ids:
         return []
 
     ensure_db()
+
+    def _normalize_chunk_ref(doc_text: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        topics_raw = meta.get("topics", "")
+        topics = [t for t in str(topics_raw).split(",") if t.strip()]
+        core_topics_raw = meta.get("core_topics", "")
+        core_topics = [t for t in str(core_topics_raw).split(",") if t.strip()]
+        return {
+            "doc_id": meta.get("doc_id"),
+            "file_name": meta.get("file_name", "未知檔案"),
+            "content": doc_text,
+            "contract_type": meta.get("contract_type", "其他"),
+            "template_role": meta.get("template_role", "歷史基準與規範"),
+            "topics": topics,
+            "topics_text": meta.get("topics", ""),
+            "core_topics": core_topics,
+            "article_no": meta.get("article_no", ""),
+            "article_title": meta.get("article_title", ""),
+            "chunk_index": meta.get("chunk_index", 0),
+            "parent_article_key": meta.get("parent_article_key", ""),
+            "clause_type": meta.get("clause_type", ""),
+            "chunk_label": meta.get("chunk_label", ""),
+            "vendor_name": meta.get("vendor_name", ""),
+            "system_name": meta.get("system_name", ""),
+            "service_scope": meta.get("service_scope", ""),
+            "maintenance_type": meta.get("maintenance_type", ""),
+            "industry": meta.get("industry", ""),
+            "contract_name": meta.get("contract_name", ""),
+        }
+
+    def _extract_keywords(text: str) -> List[str]:
+        text = normalize_text(text)
+        raw_tokens = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", text)
+        stopwords = {
+            "甲方", "乙方", "雙方", "條款", "本條", "本合約", "約定",
+            "應", "應於", "以及", "相關", "內容", "方式", "廠商", "草稿",
+            "第一條", "第二條", "第三條", "第四條", "第五條", "第六條", "第七條", "第八條", "第九條", "第十條"
+        }
+        keywords = []
+        seen = set()
+        for tok in raw_tokens:
+            if tok in stopwords:
+                continue
+            if tok not in seen:
+                seen.add(tok)
+                keywords.append(tok)
+        legal_terms = [
+            "資安檢測", "弱點掃描", "滲透測試", "管轄法院", "準據法", "爭議處置",
+            "維護人力", "維護時間", "違約金", "損害賠償", "保密義務", "個資保護",
+            "智慧財產權", "驗收", "付款", "終止", "解除", "備份", "災難復原", "事件通報",
+            "保險代理人", "招攬", "保險商品", "保戶", "要保人", "被保險人", "保險費",
+            "佣酬", "佣金", "核保", "理賠", "保險業務員", "廣告文宣", "洗錢防制",
+            "打擊資恐", "複委託", "個人資料", "利益衝突", "績效考核"
+        ]
+        for term in legal_terms:
+            if term in text and term not in seen:
+                seen.add(term)
+                keywords.insert(0, term)
+        return keywords[:12]
+
+    refs: List[Dict[str, Any]] = []
+    seen_keys = set()
+
     try:
         results = chunk_collection.query(
             query_texts=[query_text[:2000]],
-            n_results=max(n_results, 12),
+            n_results=max(n_results * 2, 12),
             where={"doc_id": {"$in": candidate_doc_ids}},
         )
+
+        docs = (results or {}).get("documents", [[]])
+        metas = (results or {}).get("metadatas", [[]])
+
+        if docs and docs[0]:
+            for i, doc_text in enumerate(docs[0]):
+                meta = metas[0][i] if metas and metas[0] and i < len(metas[0]) and metas[0][i] else {}
+                ref = _normalize_chunk_ref(doc_text, meta)
+                key = (ref["doc_id"], ref["content"][:120])
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                refs.append(ref)
     except Exception as e:
-        logging.error("歷史基準片段檢索失敗: %s", e)
-        return []
+        logging.error("歷史基準片段向量檢索失敗: %s", e)
 
-    docs  = (results or {}).get("documents", [[]])
-    metas = (results or {}).get("metadatas", [[]])
+    keywords = _extract_keywords(query_text)
+    if keywords:
+        try:
+            kw_results = chunk_collection.get(
+                where={"doc_id": {"$in": candidate_doc_ids}},
+                include=["documents", "metadatas"],
+            )
+            kw_docs = (kw_results or {}).get("documents", [])
+            kw_metas = (kw_results or {}).get("metadatas", [])
 
-    if not docs or not docs[0]:
-        return []
+            lexical_hits = []
+            for i, doc_text in enumerate(kw_docs):
+                meta = kw_metas[i] if kw_metas and i < len(kw_metas) and kw_metas[i] else {}
+                norm_doc = normalize_text(doc_text)
+                topic_text = normalize_text(str(meta.get("topics", "")))
+                title_text = normalize_text(str(meta.get("article_title", "")))
+                clause_type_text = normalize_text(str(meta.get("clause_type", "")))
+                label_text = normalize_text(str(meta.get("chunk_label", "")))
+                searchable = " ".join([norm_doc, topic_text, title_text, clause_type_text, label_text])
+                hit_count = sum(1 for kw in keywords if kw in searchable)
+                if hit_count <= 0:
+                    continue
 
-    refs = []
-    for i, doc_text in enumerate(docs[0]):
-        if len(refs) >= n_results:
-            break
-        meta = metas[0][i] if metas and metas[0] and i < len(metas[0]) and metas[0][i] else {}
-        refs.append({
-            "doc_id":        meta.get("doc_id"),
-            "file_name":     meta.get("file_name",     "未知檔案"),
-            "content":       doc_text,
-            "contract_type": meta.get("contract_type", "其他"),
-            "topics":        meta.get("topics",        ""),
-        })
-    return refs
+                ref = _normalize_chunk_ref(doc_text, meta)
+                title_bonus = sum(2 for kw in keywords if kw in title_text or kw in label_text)
+                topic_bonus = sum(3 for kw in keywords if kw in topic_text or kw in clause_type_text)
+                lexical_hits.append((hit_count + title_bonus + topic_bonus, ref))
+
+            lexical_hits.sort(key=lambda x: x[0], reverse=True)
+
+            for _, ref in lexical_hits[: max(n_results, 8)]:
+                key = (ref["doc_id"], ref["content"][:120])
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                refs.append(ref)
+
+        except Exception as e:
+            logging.warning("歷史基準片段 keyword 補召回失敗: %s", e)
+
+    refs = _dedup_chunk_refs(refs)
+
+    if target_topic:
+        refs = filter_chunks_by_topic(refs, target_topic)
+        topic_terms = _topic_filter_terms(target_topic)
+        keywords = list(dict.fromkeys(topic_terms + keywords))[:16]
+
+    refs = _mmr_select_refs(refs, keywords=keywords, top_n=n_results, lambda_=0.65)
+    return refs[:n_results]

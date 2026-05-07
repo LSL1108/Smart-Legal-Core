@@ -4,10 +4,11 @@ import datetime
 import logging
 import time
 import requests
+import json
 
 from database import (
     count_history_records, insert_history_records, get_all_templates,
-    get_compliance_rules, upsert_compliance_rule, delete_compliance_rule,  
+    get_compliance_rules, upsert_compliance_rule, delete_compliance_rule,
 )
 from utils import extract_text_from_pdf, extract_text_from_docx
 
@@ -19,12 +20,47 @@ def cached_get_all_templates():
     return get_all_templates()
 
 
-@st.cache_data(ttl=10)  
+@st.cache_data(ttl=10)
 def cached_get_compliance_rules():
     return get_compliance_rules()
 
 
-# UI 渲染輔助函式
+def stream_review_events(draft_text: str, top_k: int = 5):
+    with requests.post(
+        f"{API_BASE_URL}/review/stream",
+        json={"draft_text": draft_text, "top_k": top_k},
+        stream=True,
+        timeout=6000,
+    ) as response:
+        response.raise_for_status()
+
+        event_type = None
+        data_lines = []
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if raw_line is None:
+                continue
+
+            line = raw_line.strip()
+
+            if not line:
+                if event_type and data_lines:
+                    data_str = "\n".join(data_lines)
+                    try:
+                        payload = json.loads(data_str)
+                    except Exception:
+                        payload = {"raw": data_str}
+                    yield {"event": event_type, "data": payload}
+                event_type = None
+                data_lines = []
+                continue
+
+            if line.startswith("event:"):
+                event_type = line[len("event:"):].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:"):].strip())
+
+
 def risk_label(risk: str) -> str:
     r = (risk or "").lower()
     if r == "critical":
@@ -44,39 +80,45 @@ def render_issue_block(item: dict):
     elif issue_type == "deviation":
         issue_type_label = "（標準偏離）"
 
-    st.markdown(f"#### {risk_label(item.get('risk'))}｜{item.get('clause', '未命名條款')} {issue_type_label}")
+    risk_value = item.get("risk_level") or item.get("risk") or item.get("riskLevel")
+    st.markdown(f"#### {risk_label(risk_value)}｜{item.get('clause', '未命名條款')} {issue_type_label}")
     with st.container(border=True):
         if item.get("draft_text"):
             with st.expander("點擊展開：廠商草稿內容"):
                 st.write(item["draft_text"])
 
-        if item.get("template_basis"):
-            with st.expander(" 點擊展開：企業法遵與歷史基準依據"):
-                st.write(item["template_basis"])
+        template_text = item.get("template_basis") or item.get("template_snippet")
+        if template_text:
+            with st.expander("點擊展開：企業法遵與歷史基準依據"):
+                st.write(template_text)
 
         if item.get("analysis"):
-            st.markdown(" **合規落差分析**")
+            st.markdown("**合規落差分析**")
             st.write(item["analysis"])
 
         if item.get("suggestion"):
-            st.markdown(" **建議修正與協商方案**")
+            st.markdown("**建議修正與協商方案**")
             st.write(item["suggestion"])
 
         if item.get("adjusted_clause") and item["adjusted_clause"] != "符合，無需修改":
-            st.markdown(" **建議修改後條文**")
+            st.markdown("**建議修改後條文**")
             st.info(item["adjusted_clause"])
 
         if item.get("negotiation_notes"):
-            st.markdown(" **協商備忘（最低底線）**")
+            st.markdown("**協商備忘（最低底線）**")
             st.caption(item["negotiation_notes"])
 
         if item.get("source"):
-            st.caption(f" 參考來源：{item['source']}")
+            st.caption(f"參考來源：{item['source']}")
+
+        law_refs = item.get("law_refs") or item.get("lawRefs") or []
+        if law_refs:
+            st.caption("引用法規：" + "、".join(str(x) for x in law_refs if str(x).strip()))
 
 
 def render_missing_block(item: dict):
     with st.container(border=True):
-        st.markdown(f"** {item.get('clause', '未命名條款')}**")
+        st.markdown(f"**{item.get('clause', '未命名條款')}**")
         if item.get("why_missing"):
             st.markdown("**缺漏原因**")
             st.write(item["why_missing"])
@@ -85,15 +127,15 @@ def render_missing_block(item: dict):
             st.write(item["suggestion"])
 
         if item.get("suggested_draft"):
-            st.markdown(" **建議補充條文草稿**")
+            st.markdown("**建議補充條文草稿**")
             st.info(item["suggested_draft"])
 
         if item.get("template_snippet"):
-            with st.expander(" 點擊展開：企業智庫原文參考"):
+            with st.expander("點擊展開：企業智庫原文參考"):
                 st.info(item["template_snippet"])
 
         if item.get("source"):
-            st.caption(f" 參考來源：{item['source']}")
+            st.caption(f"參考來源：{item['source']}")
 
 
 def render_compliance_scan(compliance_scan: list):
@@ -101,32 +143,32 @@ def render_compliance_scan(compliance_scan: list):
         return
 
     st.markdown("---")
-    st.markdown("###  章則規範義務稽核")
+    st.markdown("### 章則規範義務稽核")
 
     covered = [r for r in compliance_scan if r.get("is_covered")]
     uncovered = [r for r in compliance_scan if not r.get("is_covered")]
 
     col1, col2 = st.columns(2)
-    col1.metric(" 已涵蓋義務", f"{len(covered)} 項")
-    col2.metric(" 缺漏義務", f"{len(uncovered)} 項")
+    col1.metric("已涵蓋義務", f"{len(covered)} 項")
+    col2.metric("缺漏義務", f"{len(uncovered)} 項")
 
     if uncovered:
-        st.markdown("####  尚未涵蓋的廠商義務")
+        st.markdown("#### 尚未涵蓋的廠商義務")
         for r in uncovered:
             with st.container(border=True):
                 st.markdown(f"**{r.get('requirement', '未知義務')}**")
                 if r.get("gap_description"):
                     st.warning(r["gap_description"])
                 if r.get("suggested_addition"):
-                    st.markdown(" **建議補入條文**")
+                    st.markdown("**建議補入條文**")
                     st.info(r["suggested_addition"])
 
     if covered:
-        with st.expander(f"✅ 點擊展開：已涵蓋的 {len(covered)} 項義務"):
+        with st.expander(f"點擊展開：已涵蓋的 {len(covered)} 項義務"):
             for r in covered:
                 st.markdown(f"- **{r.get('requirement')}**")
                 if r.get("found_clause"):
-                    st.caption(f"  合約對應文字：{r['found_clause'][:100]}...")
+                    st.caption(f"合約對應文字：{r['found_clause'][:100]}...")
 
 
 def render_gap_analysis(gap_analysis: dict):
@@ -134,7 +176,7 @@ def render_gap_analysis(gap_analysis: dict):
         return
 
     st.markdown("---")
-    st.markdown("###  跨合約差距分析")
+    st.markdown("### 跨合約差距分析")
 
     if gap_analysis.get("gap_summary"):
         st.info(f"**差距摘要**：{gap_analysis['gap_summary']}")
@@ -145,31 +187,42 @@ def render_gap_analysis(gap_analysis: dict):
 
             col_l, col_r = st.columns(2)
             with col_l:
-                st.markdown(" **歷史合約作法**")
+                st.markdown("**歷史合約作法**")
                 st.write(g.get("other_vendors_coverage") or "無資料")
             with col_r:
-                st.markdown(" **本次廠商現況**")
+                st.markdown("**本次廠商現況**")
                 st.write(g.get("current_vendor_status") or "未知")
 
             scenario = g.get("vendor_refuse_scenario", {})
             if scenario:
-                with st.expander("⚠️ 若廠商拒絕配合：風險與應對方案"):
+                with st.expander("若廠商拒絕配合：風險與應對方案"):
                     if scenario.get("risk_description"):
                         st.error(f"**具體風險**：{scenario['risk_description']}")
                     if scenario.get("cost_bearing_suggestion"):
-                        st.markdown(f"💰 **費用分擔建議**：{scenario['cost_bearing_suggestion']}")
+                        st.markdown(f"**費用分擔建議**：{scenario['cost_bearing_suggestion']}")
                     if scenario.get("alternative_clause"):
-                        st.markdown("📝 **替代條文草稿**")
+                        st.markdown("**替代條文草稿**")
                         st.info(scenario["alternative_clause"])
 
 
 def render_review_dashboard(data: dict):
+    risk_cards = data.get("risk_cards") or []
+    major = data.get("major_issues", []) or []
+    general = data.get("general_issues", []) or []
+    if risk_cards:
+        major = [
+            item for item in risk_cards
+            if str(item.get("risk_level") or item.get("risk") or item.get("riskLevel") or "").lower() in ["critical", "high"]
+        ]
+        general = [
+            item for item in risk_cards
+            if str(item.get("risk_level") or item.get("risk") or item.get("riskLevel") or "").lower() not in ["critical", "high"]
+        ]
+
+    missing = data.get("missing_clauses", []) or []
+
     col1, col2 = st.columns([1, 3])
     with col1:
-        major = data.get("major_issues", [])
-        missing = data.get("missing_clauses", [])
-        general = data.get("general_issues", [])
-
         if major or missing:
             status_text = "🔴 高風險"
         elif general:
@@ -181,13 +234,13 @@ def render_review_dashboard(data: dict):
 
     with col2:
         st.info(
-            f"** 合約類型判定**：{data.get('contract_type_guess', '未判定')}\n\n"
-            f"** 系統總結摘要**：{data.get('summary', '無摘要')}"
+            f"**合約類型判定**：{data.get('contract_type_guess', '未判定')}\n\n"
+            f"**系統總結摘要**：{data.get('summary', '無摘要')}"
         )
 
     used_templates = data.get("used_templates", [])
     if used_templates:
-        st.markdown("###  本次比對歷史基準與法遵智庫")
+        st.markdown("### 本次比對歷史基準與法遵智庫")
         for t in used_templates:
             with st.container(border=True):
                 st.markdown(f"**📄 {t.get('file_name', '未知檔案')}**")
@@ -198,19 +251,19 @@ def render_review_dashboard(data: dict):
 
     if major:
         st.markdown("---")
-        st.markdown("### 🚨 重大違規 / 衝突")
+        st.markdown("### 重大違規 / 衝突")
         for item in major:
             render_issue_block(item)
 
     if general:
         st.markdown("---")
-        st.markdown("### ⚠️ 一般違規")
+        st.markdown("### 一般違規")
         for item in general:
             render_issue_block(item)
 
     if missing:
         st.markdown("---")
-        st.markdown("### 🧩 歷史規範缺漏條款")
+        st.markdown("### 歷史規範缺漏條款")
         for item in missing:
             render_missing_block(item)
 
@@ -218,7 +271,6 @@ def render_review_dashboard(data: dict):
     render_gap_analysis(data.get("gap_analysis", {}))
 
 
-# 主程式 UI
 st.set_page_config(
     page_title="自動化合約審查系統 | Core",
     layout="wide",
@@ -242,13 +294,13 @@ with st.sidebar:
 
 
 if page == "合約審查系統":
-    st.markdown("##  合約檢核與生成系統")
+    st.markdown("## 合約檢核與生成系統")
     st.info(
-        " **系統終端指令**：\n"
-        " `/review`（合約審查）\n"
-        " `/risk `（報價分析）\n"
-        " `/generate `（合約生成）\n"
-        " **直接輸入文字** 即可與 AI 法務助理對話討論合約內容。",
+        "**系統終端指令**：\n"
+        "`/review`（合約審查）\n"
+        "`/risk`（報價分析）\n"
+        "`/generate`（合約生成）\n"
+        "**直接輸入文字** 即可與 AI 法務助理對話討論合約內容。"
     )
 
     if "messages" not in st.session_state:
@@ -315,27 +367,73 @@ if page == "合約審查系統":
                 })
                 st.rerun()
             else:
-                with st.spinner("正在掃描企業合規與歷史基準..."):
-                    try:
-                        response = requests.post(
-                            f"{API_BASE_URL}/review",
-                            json={"draft_text": draft_content, "top_k": 5},
-                            timeout=6000
-                        )
-                        response.raise_for_status()
-                        review_json = response.json()
+                progress_title = st.empty()
+                progress_stage = st.empty()
+                progress_bar = st.progress(0)
+                review_json = None
 
-                        st.session_state.draft_content = draft_content
-                        st.session_state.review_context = review_json
+                stage_label_map = {
+                    "parse_request": "解析使用者需求",
+                    "start": "開始審查",
+                    "detect_contract_type": "判定合約類型",
+                    "prepare_articles": "分析條款類型",
+                    "select_templates": "檢索相關歷史合約",
+                    "retrieve_chunks": "檢索相關條款片段",
+                    "review_articles": "逐條審查",
+                    "infer_missing": "比對缺漏條款",
+                    "draft_missing_clauses": "起草缺漏條文",
+                    "compliance_scan": "合規義務掃描",
+                    "finalize": "整理審查資料",
+                    "finalize_report": "整理最終報告",
+                    "done": "完成",
+                }
 
-                        st.session_state.messages.append({
-                            "role": "assistant", "content": review_json
-                        })
-                    except requests.exceptions.RequestException as e:
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": f"⚠️ API 呼叫失敗，請確認 FastAPI 伺服器已啟動且運作正常。詳細錯誤: {e}"
-                        })
+                try:
+                    progress_title.info("正在掃描企業合規與歷史基準...")
+                    for evt in stream_review_events(draft_content, top_k=5):
+                        event_type = evt.get("event")
+                        data = evt.get("data", {})
+
+                        if event_type == "progress":
+                            percent = int(data.get("percent", 0))
+                            stage = data.get("stage", "")
+                            message = data.get("message", "處理中...")
+                            stage_text = stage_label_map.get(stage, stage or "處理中")
+
+                            progress_bar.progress(max(0, min(percent, 100)))
+                            progress_stage.markdown(f"**{stage_text}**｜{message}")
+
+                        elif event_type == "result":
+                            review_json = data
+
+                        elif event_type == "error":
+                            raise Exception(data.get("message", "未知錯誤"))
+
+                    if review_json is None:
+                        raise Exception("未收到最終審查結果")
+
+                    progress_bar.progress(100)
+                    progress_stage.markdown("**完成**｜審查完成")
+                    progress_title.success("合約審查完成")
+
+                    st.session_state.draft_content = draft_content
+                    st.session_state.review_context = review_json
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": review_json
+                    })
+
+                except requests.exceptions.RequestException as e:
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": f"⚠️ API 呼叫失敗，請確認 FastAPI 伺服器已啟動且運作正常。詳細錯誤: {e}"
+                    })
+                except Exception as e:
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": f"⚠️ 串流審查失敗。錯誤: {e}"
+                    })
+
                 st.rerun()
 
         elif msg_text.startswith("/risk"):
@@ -427,7 +525,6 @@ if page == "合約審查系統":
             pass
 
 
-# 企業法遵與歷史合約管理
 elif page == "歷史合約管理":
     st.markdown("## 歷史合約中樞")
 
@@ -473,11 +570,11 @@ elif page == "歷史合約管理":
             types_count[ctype] = types_count.get(ctype, 0) + 1
 
         cols = st.columns(len(types_count) + 1)
-        cols[0].metric(" 資料庫檔案總數", f"{len(docs)} 份")
+        cols[0].metric("資料庫檔案總數", f"{len(docs)} 份")
         for i, (ctype, count) in enumerate(types_count.items(), 1):
             cols[i].metric(f"🏷️ {ctype}", f"{count} 份")
 
-        st.markdown("### 🔍 檢索與管理")
+        st.markdown("### 檢索與管理")
 
         col_search, col_filter = st.columns([2, 1])
         with col_search:
@@ -513,7 +610,7 @@ elif page == "歷史合約管理":
                     st.caption(f"入庫時間：{doc.get('created_at')}")
 
                 with action_col:
-                    if st.button("🗑️ 永久刪除", key=f"del_{doc['doc_id']}", type="primary", width="stretch"):
+                    if st.button("🗑️ 永久刪除", key=f"del_{doc['doc_id']}", type="primary", use_container_width=True):
                         try:
                             res = requests.delete(f"{API_BASE_URL}/templates/{doc['doc_id']}", timeout=30)
                             res.raise_for_status()
@@ -525,7 +622,7 @@ elif page == "歷史合約管理":
                             st.error(f"刪除失敗，請確認 FastAPI 運行狀態。錯誤: {e}")
 
     st.markdown("---")
-    st.markdown("### ⚖️ 企業內部規則庫")
+    st.markdown("### 企業內部規則庫")
     st.caption("集中管理合約審查標準。系統將依據此處定義之規範，自動稽核廠商合約是否有遺漏或偏離。")
 
     current_rules = cached_get_compliance_rules()
@@ -537,7 +634,7 @@ elif page == "歷史合約管理":
         with col_input:
             new_topic = st.text_input("新主題名稱", placeholder="輸入新主題，例如：營業秘密保護", label_visibility="collapsed")
         with col_btn:
-            if st.button("＋ 建立主題", type="primary", width="stretch"):
+            if st.button("＋ 建立主題", type="primary", use_container_width=True):
                 if not new_topic.strip():
                     st.warning("⚠️ 請輸入主題名稱")
                 elif new_topic.strip() in topics:
@@ -569,7 +666,7 @@ elif page == "歷史合約管理":
                 )
                 col_save, col_space, col_del = st.columns([2, 5, 2])
                 with col_save:
-                    if st.button("儲存修改", key=f"save_{topic}", type="primary", width="stretch"):
+                    if st.button("儲存修改", key=f"save_{topic}", type="primary", use_container_width=True):
                         new_examples = [e.strip() for e in examples_text.split("\n") if e.strip()]
                         if not new_examples:
                             st.warning("⚠️ 規範內容不能為空")
@@ -579,11 +676,11 @@ elif page == "歷史合約管理":
                             st.cache_data.clear()
                             time.sleep(0.4)
                             st.rerun()
-                
+
                 with col_del:
-                    with st.popover("刪除主題", width="stretch"):
+                    with st.popover("刪除主題", use_container_width=True):
                         st.markdown(f"確定要永久刪除 **{topic}** 嗎？")
-                        if st.button("確認刪除", key=f"del_{topic}", type="primary", width="stretch"):
+                        if st.button("確認刪除", key=f"del_{topic}", type="primary", use_container_width=True):
                             delete_compliance_rule(topic)
                             st.toast(f"已刪除主題：{topic}")
                             st.cache_data.clear()

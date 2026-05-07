@@ -156,48 +156,176 @@ def parse_template_selector(text: str) -> Dict[str, str]:
         return {"file_name": m.group(1).strip()}
     return {}
 
-# Semantic Chunking
-def chunk_text(text: str, chunk_size: int = 650, overlap: int = 120) -> List[str]:
+# 條文感知切分與 chunking
+# 合約條文條號正則：支援中文數字、大寫中文數字與阿拉伯數字
+_ARTICLE_NUM_RE = r"[一二三四五六七八九十百千萬壹貳參肆伍陸柒捌玖拾0-9]+"
+
+# 只在行首辨識「第X條」，避免把「民法第184條」誤切成合約條款。
+ARTICLE_HEADER_RE = re.compile(
+    rf"(?=(?:^|\n)\s*第\s*{_ARTICLE_NUM_RE}\s*條(?:[：:、\s]|$))",
+    flags=re.M,
+)
+
+ARTICLE_NO_TITLE_RE = re.compile(
+    rf"^\s*(第\s*({_ARTICLE_NUM_RE})\s*條)\s*[：:、]?\s*([^\n]{{0,60}})?",
+    flags=re.M,
+)
+
+_HEADING_PATTERN = re.compile(
+    rf"^(?:#+\s+|[一二三四五六七八九十百千萬壹貳參肆伍陸柒捌玖拾]+、|第\s*{_ARTICLE_NUM_RE}\s*條)"
+)
+
+def _clean_article_title(title: str) -> str:
+    """清理條文標題，避免把整段條文誤當成標題。"""
+    title = normalize_text(title or "")
+    title = re.sub(r"^[：:、\s]+", "", title).strip()
+    if not title:
+        return ""
+
+    # 標題通常很短；若含句號、分號或過長，代表可能抓到正文。
+    if len(title) > 24:
+        return ""
+    if re.search(r"[。；;]", title):
+        return ""
+    return title
+
+
+def _article_header_label(article_no: str, article_title: str = "") -> str:
+    article_no = normalize_text(article_no or "")
+    article_title = normalize_text(article_title or "")
+    if article_no and article_title:
+        return f"{article_no} {article_title}"
+    if article_no:
+        return article_no
+    if article_title:
+        return article_title
+    return ""
+
+def detect_topics_fast(text: str) -> List[str]:
     """
-    合約專用語義切塊演算法：
-    優先依照「第X條」進行切割，確保法條語義完整。若單一條文過長，再依賴長度切塊。
+    便宜版 topic 偵測：先用關鍵字快速判斷，命中才直接回傳；
+    若沒有命中，再由 detect_topics 用 LLM 補強。
     """
+    text_n = normalize_text(text)
+    if not text_n:
+        return []
+
+    found = []
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        min_hits = TOPIC_MIN_MATCHES.get(topic, 1)
+        hits = sum(1 for k in keywords if k and k in text_n)
+        if hits >= min_hits:
+            found.append(topic)
+
+    dedup = []
+    seen = set()
+    for t in found:
+        nt = normalize_topic_name(t)
+        if nt and nt not in seen:
+            seen.add(nt)
+            dedup.append(nt)
+    return dedup
+
+def _split_text_into_article_blocks(text: str) -> List[str]:
     text = normalize_text(text)
     if not text:
         return []
 
-    pattern   = r"(?=\n?第[一二三四五六七八九十百0-9]+條[：:\s])"
-    raw_chunks = re.split(pattern, text)
+    raw_parts = re.split(ARTICLE_HEADER_RE, text)
+    parts = [normalize_text(p) for p in raw_parts if normalize_text(p)]
 
-    chunks        = []
-    current_chunk = ""
+    # 若條文數量不足，退回通用單段，避免把一般文件切得太碎。
+    return parts if len(parts) >= 2 else [text]
 
-    for part in raw_chunks:
-        part = part.strip()
-        if not part:
+def _parse_article_block(raw: str, idx: int) -> Dict[str, Any]:
+    raw = normalize_text(raw)
+    first_line = raw.split("\n", 1)[0].strip()
+
+    m = ARTICLE_NO_TITLE_RE.match(first_line)
+    if m:
+        article_no = re.sub(r"\s+", "", m.group(1))
+        possible_title = _clean_article_title(m.group(3) or "")
+
+        return {
+            "article_no": article_no,
+            "title": possible_title,
+            "content": raw,
+            "topics": [],
+            "parent_article_key": article_no or f"ARTICLE_{idx}",
+        }
+
+    return {
+        "article_no": "",
+        "title": "",
+        "content": raw,
+        "topics": [],
+        "parent_article_key": f"ARTICLE_{idx}",
+    }
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 120) -> List[Dict[str, Any]]:
+    """
+    合約專用 article-aware chunking：
+    1. 先按條文切分
+    2. 原則上一條一塊
+    3. 若單一條文過長，再切成子 chunk
+    4. 保留 article metadata，供後續檢索與引用
+    """
+    articles = split_draft_into_articles(text)
+    if not articles:
+        return []
+
+    chunks: List[Dict[str, Any]] = []
+
+    for idx, article in enumerate(articles, start=1):
+        article_no = (article.get("article_no") or "").strip()
+        article_title = (article.get("title") or "").strip()
+        article_text = normalize_text(article.get("content", ""))
+        article_topics = article.get("topics", []) or []
+
+        parent_article_key = (
+            article.get("parent_article_key")
+            or article_no
+            or article_title
+            or f"ARTICLE_{idx}"
+        )
+
+        if not article_text:
             continue
 
-        if len(current_chunk) + len(part) <= chunk_size:
-            current_chunk += ("\n\n" + part if current_chunk else part)
-        else:
-            if current_chunk:
-                chunks.append(current_chunk)
-                tail = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-            else:
-                tail = ""
+        if len(article_text) <= chunk_size:
+            chunks.append({
+                "article_no": article_no,
+                "article_title": article_title,
+                "content": article_text,
+                "chunk_index": 0,
+                "parent_article_key": parent_article_key,
+                "topics": article_topics,
+            })
+            continue
 
-            if len(part) > chunk_size:
-                start = 0
-                step  = max(1, chunk_size - overlap)
-                while start < len(part):
-                    chunks.append(part[start:start + chunk_size])
-                    start += step
-                current_chunk = part[-overlap:] if len(part) > overlap else part
-            else:
-                current_chunk = (tail + "\n\n" + part) if tail else part
+        step = max(1, chunk_size - overlap)
+        start = 0
+        chunk_index = 0
 
-    if current_chunk:
-        chunks.append(current_chunk)
+        header_label = _article_header_label(article_no, article_title)
+
+        while start < len(article_text):
+            piece = article_text[start:start + chunk_size].strip()
+            if piece:
+                # 長條款被切成多段時，續段補上條號／標題，避免檢索後失去所屬條文脈絡。
+                if chunk_index > 0 and header_label and not piece.startswith(article_no):
+                    piece = f"{header_label}（續）\n{piece}"
+
+                chunks.append({
+                    "article_no": article_no,
+                    "article_title": article_title,
+                    "content": piece,
+                    "chunk_index": chunk_index,
+                    "parent_article_key": parent_article_key,
+                    "topics": article_topics,
+                })
+                chunk_index += 1
+            start += step
 
     return chunks
 
@@ -220,7 +348,7 @@ def detect_contract_mode_from_text(text: str) -> str:
         "維護": any(k in text for k in ["維護", "維運", "故障", "SLA", "修復"]),
         "開發": any(k in text for k in ["開發", "系統設計", "原始碼", "程式碼", "平台", "智慧財產權"]),
         "保密": any(k in text for k in ["保密", "機密", "揭露", "GitHub", "開源"]),
-    }   
+    }
     active = [k for k, v in flags.items() if v]
     if len(active) >= 2:
         return "混合型"
@@ -228,26 +356,31 @@ def detect_contract_mode_from_text(text: str) -> str:
 
 def detect_topics(text: str) -> List[str]:
     """
-    LLM 語意分類器 加上嚴格 JSON 提取與防空值保護
+    LLM 語意分類器，加上嚴格 JSON 提取與防空值保護。
+    先走 fast path，減少不必要的模型呼叫。
     """
     text = normalize_text(text)
     if not text or len(text) < 10:
         return []
 
+    fast_topics = detect_topics_fast(text)
+    if fast_topics:
+        return fast_topics
+
     prompt = f"""
     你是一個專業的法務合約分類系統。請閱讀以下合約條文，並判斷它涉及哪些主題。
-    
+
     【強制規定】：
     1. 只能從以下「標準主題清單」中挑選，絕對不能自己發明新詞彙：
     {", ".join(ALL_TOPICS_FOR_PROMPT)}
     2. 若條文提及「對價、匯款、費用」，請歸類為「付款價金」。
     3. 如果該條文沒有涉及清單中的任何主題，請讓陣列保持空白。
     4. 必須輸出合法的 JSON 物件格式，範例：{{"topics": ["付款價金", "違約金"]}}。絕對不要輸出其他說明文字。
-    
+
     條文內容：
     {text[:800]}
     """
-    
+
     raw_response = ""
     try:
         res = ollama.generate(
@@ -256,29 +389,30 @@ def detect_topics(text: str) -> List[str]:
             format="json",
             options={"temperature": 0.0, "top_p": 0.1}
         )
-        
+
         raw_response = (res or {}).get("response", "{}").strip()
         raw_response = re.sub(r"```json\s*", "", raw_response)
         raw_response = re.sub(r"```", "", raw_response).strip()
-            
+
         data = json.loads(raw_response)
         topics = data.get("topics", [])
-        
+
         if not isinstance(topics, list):
             topics = [t for t in ALL_TOPICS_FOR_PROMPT if t in raw_response]
-            
+
         valid_topics = []
+        seen = set()
         for t in topics:
-            t_str = str(t).strip()
-            if t_str in ALL_TOPICS_FOR_PROMPT:
+            t_str = normalize_topic_name(str(t).strip())
+            if t_str in ALL_TOPICS_FOR_PROMPT and t_str not in seen:
+                seen.add(t_str)
                 valid_topics.append(t_str)
-                
+
         return valid_topics
-        
+
     except Exception as e:
         logging.warning(f"LLM 判斷主題失敗: {e} | 退回字串暴力比對模式")
         return [t for t in ALL_TOPICS_FOR_PROMPT if t in text]
-            
 
 def score_topic_overlap(a: List[str], b: List[str]) -> int:
     return len(set(a or []) & set(b or []))
@@ -300,46 +434,19 @@ def parse_core_topics_field(val: Any) -> List[str]:
         return [normalize_topic_name(x) for x in parts if x.strip()]
     return []
 
-# 草稿解析工具 
+# 草稿解析工具
 def split_draft_into_articles(text: str) -> List[Dict[str, Any]]:
     text = normalize_text(text)
     if not text:
         return []
 
-    pattern = r"(第[一二三四五六七八九十百0-9]+條[：:][\s]*.*?)(?=(?:\n?第[一二三四五六七八九十百0-9]+條[：:])|$)"
-    matches = re.findall(pattern, text, flags=re.S)
-
-    raw_articles = []
-    if matches:
-        for raw in matches:
-            raw = normalize_text(raw)
-            m   = re.match(r"(第[一二三四五六七八九十百0-9]+條)[：:]\s*([^\n ]+)?\s*(.*)", raw, flags=re.S)
-            if m:
-                content = normalize_text(raw)
-                raw_articles.append({
-                    "article_no": m.group(1).strip(),
-                    "title":      (m.group(2) or "").strip(),
-                    "content":    content,
-                    "topics":     [], 
-                })
-            else:
-                raw_articles.append({
-                    "article_no": "",
-                    "title":      "",
-                    "content":    raw,
-                    "topics":     [], 
-                })
-    else:
-        paras = [p.strip() for p in text.split("\n") if p.strip()]
-        for p in paras:
-            raw_articles.append({
-                "article_no": "",
-                "title":      "",
-                "content":    p,
-                "topics":     [], 
-            })
+    raw_blocks = _split_text_into_article_blocks(text)
+    raw_articles = [_parse_article_block(raw, idx + 1) for idx, raw in enumerate(raw_blocks)]
 
     def _detect_and_return(idx, content):
+        fast_topics = detect_topics_fast(content)
+        if fast_topics:
+            return idx, fast_topics
         return idx, detect_topics(content)
 
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -355,13 +462,51 @@ def build_article_map(articles: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any
     for idx, a in enumerate(articles, start=1):
         no    = (a.get("article_no", "") or "").strip()
         title = (a.get("title",      "") or "").strip()
+        parent_key = (a.get("parent_article_key", "") or "").strip()
+
         if no:
             article_map[no] = a
-        article_map[f"ARTICLE_{idx}"] = a
         if title:
             article_map[title] = a
+        if parent_key:
+            article_map[parent_key] = a
+
+        article_map[f"ARTICLE_{idx}"] = a
     return article_map
 
 def article_to_key(article: Dict[str, Any], idx: int) -> str:
     no = (article.get("article_no", "") or "").strip()
-    return no if no else f"ARTICLE_{idx}"
+    if no:
+        return no
+
+    parent_key = (article.get("parent_article_key", "") or "").strip()
+    if parent_key:
+        return parent_key
+
+    return f"ARTICLE_{idx}"
+
+def detect_clause_type(article_text: str, article_title: str = "") -> str:
+    text = normalize_text(f"{article_title} {article_text}")
+
+    rules = [
+        ("付款條款", ["付款", "價金", "費用", "匯款", "發票", "請款", "報酬", "對價"]),
+        ("違約責任", ["違約", "違約金", "逾期", "遲延", "損害賠償", "賠償責任"]),
+        ("維護服務/SLA", ["維護", "維運", "故障", "修復", "回覆時限", "服務水準", "SLA", "弱點修補"]),
+        ("保密條款", ["保密", "機密", "秘密資訊", "不得揭露", "揭露", "保密義務"]),
+        ("智慧財產條款", ["智慧財產", "著作權", "專利", "原始碼", "程式碼", "技術成果", "授權"]),
+        ("驗收交付條款", ["驗收", "交付", "測試", "上線", "交付物", "成果交付"]),
+        ("爭議解決條款", ["爭議", "準據法", "管轄", "法院", "仲裁", "合意裁判"]),
+        ("人力配置條款", ["人力", "專責", "工程師", "人員", "窗口", "團隊成員"]),
+    ]
+
+    scores = []
+    for clause_type, keywords in rules:
+        hit_count = sum(1 for kw in keywords if kw in text)
+        if hit_count > 0:
+            scores.append((hit_count, clause_type))
+
+    if not scores:
+        return "一般條款"
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+    return scores[0][1]
