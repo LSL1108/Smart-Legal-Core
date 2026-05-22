@@ -1,0 +1,232 @@
+# ============================================================
+# 通用紅線規則 — 任何合約類型都適用
+# ============================================================
+# 維護建議：
+# 1. 加新規則時 id 需全域唯一
+# 2. 若該規則只適用某幾種合約，請改放到對應領域檔
+# 3. 「我不確定算不算通用」的時候 → 放這裡，applicable_contract_types: ["*"]
+#    領域規則才用列舉
+
+# === 管轄法院 / 準據法 ===
+- id: foreign_jurisdiction
+  topic: 管轄法院
+  risk: High
+  type: deviation
+  applicable_contract_types: ["*"]
+  match:
+    any_of:
+      # 美國各種寫法
+      - "美國加州"
+      - "美國"
+      - "美利堅合眾國"
+      - "USA"
+      - "United States"
+      - "U.S."
+      # 州 / 區域
+      - "加州"
+      - "加利福尼亞"
+      - "California"
+      - "紐約州"
+      - "New York"
+      - "美西"
+      - "太平洋沿岸"
+      # 法院類型
+      - "聯邦法院"
+      - "聯邦地方法院"
+      - "聯邦裁判機關"
+      - "Federal Court"
+      - "州法院"
+      - "外國法院"
+      - "外國裁判機關"
+      - "境外法院"
+      # 通用
+      - "適用當地"
+      - "當地商業法規"
+      - "當地法律"
+      - "州級"
+  exclude:
+    near_terms: ["不得", "禁止", "排除", "非", "並非"]
+    window: 8
+  analysis_template: |
+    本條出現「{matched}」等涉外管轄字眼，可能將第一審管轄機構或準據法指向外國法院或境外法律。
+    這會提高甲方爭議處理成本、跨境訴訟負擔，並導致法律適用不確定。
+  suggestion: |
+    建議將第一審管轄法院調整為台灣台北地方法院，並明確約定準據法為中華民國法律；
+    不得以模糊地理範圍或外國裁判機關取代明確管轄法院。
+  adjusted_clause: 雙方同意因本合約所生之爭議，以台灣台北地方法院為第一審管轄法院，並以中華民國法律為準據法。
+
+# === 管轄法院（語意 fallback）===
+- id: foreign_jurisdiction_semantic
+  topic: 管轄法院
+  risk: High
+  type: deviation
+  applicable_contract_types: ["*"]
+  match:
+    any_of: []  # 純 semantic
+  semantic_match:
+    examples:
+      - "本合約以美國加州法院為第一審管轄"
+      - "爭議由境外司法機關裁判"
+      - "適用合約簽訂地之當地法律"
+      - "由廠商所在國法院管轄"
+    threshold: 0.62
+  exclude:
+    near_terms: ["不得", "禁止", "排除"]
+    window: 12
+  analysis_template: |
+    本條語意上可能將管轄或準據法指向境外（語意比對命中：{matched}）。
+    建議人工確認實際內容是否要求外國法院管轄或外國法律適用。
+  suggestion: 建議人工檢視本條條款，並調整為以台灣法院管轄、中華民國法律為準據法。
+  adjusted_clause: 雙方同意因本合約所生之爭議，以台灣台北地方法院為第一審管轄法院，並以中華民國法律為準據法。
+
+
+# === 保密與開源 ===
+- id: confidentiality_disclosure
+  topic: 保密與開源
+  risk: High
+  type: deviation
+  applicable_contract_types: ["*"]
+  match:
+    any_of:
+      # 公開揭露
+      - "公開原始碼"
+      - "公開程式碼"
+      - "公開技術文件"
+      - "開源"
+      - "開放原始碼"
+      - "open source"
+      # 上傳平台
+      - "上傳 GitHub"
+      - "上傳GitHub"
+      - "上傳至 GitHub"
+      - "上傳至GitHub"
+      - "GitHub"
+      - "GitLab"
+      - "Bitbucket"
+      - "公有 Git"
+      - "雲端代碼儲存"
+      - "雲端代碼儲存空間"
+      - "公開儲存庫"
+      # 不特定揭露
+      - "公眾可無償存取"
+      - "不特定多數人查閱"
+      - "不特定第三人"
+      - "查閱、複製與優化"
+      - "公眾可閱覽"
+  exclude:
+    near_terms: ["不得", "禁止", "未經", "事前書面", "排除", "非"]
+    window: 10
+  analysis_template: |
+    本條出現「{matched}」等公開、上傳、開源相關字眼，乙方可能將專案產出、程式碼或技術文件
+    提供予不特定第三人查閱、複製或優化，將產生機密資訊外洩、智慧財產權歸屬不明與資安風險。
+  suggestion: |
+    建議明確約定乙方未經甲方事前書面同意，不得公開、上傳、開源、揭露或提供任何涉及本專案之
+    程式碼、系統架構、技術文件、資料集或衍生模組予第三人。
+  adjusted_clause: 乙方未經甲方事前書面同意，不得公開、上傳、開源或提供任何涉及本專案之程式碼、系統架構、技術文件或資料予第三人。
+
+
+# === Critical：明確違反保密 ===
+- id: confidentiality_explicit_breach
+  topic: 保密與開源
+  risk: Critical
+  type: conflict
+  applicable_contract_types: ["*"]
+  match:
+    any_of:
+      - "公開揭露"
+      - "公開原始碼"
+      - "得公開"
+      - "得對外揭露"
+      - "授權第三人公開"
+  exclude:
+    near_terms: ["不得", "禁止", "未經", "事前書面"]
+    window: 10
+  analysis_template: |
+    本條出現「{matched}」等明確允許公開揭露的字眼，與企業保密原則直接衝突。
+  suggestion: 建議刪除允許公開揭露的條款，明確規定未經書面同意不得對外公開。
+  adjusted_clause: 乙方對因本合約所知悉之機密資訊，未經甲方事前書面同意，不得對任何第三人揭露或公開。
+
+
+# === 違約金 ===
+- id: penalty_cap_too_low
+  topic: 違約金
+  risk: High
+  type: deviation
+  applicable_contract_types: ["*"]
+  # 注意：此規則只透過 regex 數值門檻觸發，不可加 match.any_of —
+  # 否則「違約金」字串會被 exact 先命中，永遠走不到數值判斷。
+  regex_match:
+    pattern: "違約金.{0,20}?上限.{0,15}?(?P<amount>[\\d,]+)\\s*[萬元]"
+    threshold:
+      capture: amount
+      op: "<"
+      value: 100   # 違約金上限 < 100 萬視為過低
+  context_required:
+    any_of: ["違約", "罰", "損害"]
+  analysis_template: |
+    本條約定的違約金上限可能過低（命中：{matched}），不足以充分補償甲方因違約所受損失，
+    可能降低乙方履約督促效果。
+  suggestion: |
+    建議重新評估違約金上限是否與合約規模、履約風險相當；
+    對於資安事件、個資外洩、重大延遲等情況，應另設較高的賠償標準或排除上限。
+  adjusted_clause: 乙方違反本合約之重大義務時，應給付不低於合約總價之 20% 為違約金；對於故意或重大過失所致損害，不適用前述上限。
+
+
+# === 損害賠償排除 ===
+- id: liability_exclusion_broad
+  topic: 損害賠償
+  risk: High
+  type: deviation
+  applicable_contract_types: ["*"]
+  regex_match:
+    pattern: "(?:不負|免除|不負擔|概不).{0,15}(?:任何|一切|所有|全部).{0,12}(?:責任|賠償|損失)"
+  exclude:
+    near_terms: ["第三人", "不可抗力", "天災", "戰爭"]  # 第三人責任 / 不可抗力本來就會排除，不算紅線
+    window: 15
+  analysis_template: |
+    本條出現「{matched}」等廣泛責任排除字眼，可能使乙方在重大過失、故意違約、資安事件等情況下
+    完全免除責任，嚴重損及甲方權益。
+  suggestion: |
+    建議排除「故意」「重大過失」「個資事件」「違法行為」「第三人求償」等情形不適用責任上限。
+  adjusted_clause: 乙方因故意、重大過失、違法行為、個資事件或第三人求償所生損害，不適用任何責任限制或排除條款。
+
+
+# === 終止事由：得隨時終止 ===
+- id: termination_at_will_unilateral
+  topic: 終止事由
+  risk: High
+  type: deviation
+  applicable_contract_types: ["*"]
+  regex_match:
+    pattern: "乙方.{0,15}?(?:得|可以)隨時.{0,10}(?:終止|解除)"
+  analysis_template: |
+    本條允許乙方「隨時終止」（命中：{matched}），可能使甲方在無法預期的情況下中斷服務，
+    影響營運穩定。
+  suggestion: 建議改為雙方需提前 30 日書面通知，並約定終止時的交接、資料返還與服務銜接義務。
+  adjusted_clause: 任一方終止本合約者，應提前 30 日以書面通知他方，並依本合約約定完成資料返還、服務交接及未完成事項處理。
+
+
+# === 個人資料保護（通用基準）===
+- id: pdpa_safeguard_vague
+  topic: 個人資料保護
+  risk: High
+  type: deviation
+  applicable_contract_types: ["*"]
+  match:
+    any_of:
+      - "合理安全措施"
+      - "合理保護措施"
+      - "適當之安全措施"
+      - "盡力保護"
+  context_required:
+    any_of: ["個資", "個人資料", "personal data", "資料保護", "隱私"]
+  exclude:
+    near_terms: ["不僅", "除", "另外"]
+    window: 6
+  analysis_template: |
+    本條僅以「{matched}」等模糊字眼描述個資安全措施，未明確列出具體要求，
+    不足以支撐甲方法遵與監督義務。
+  suggestion: |
+    建議明確約定具體安全維護措施（加密、存取控制、稽核日誌等）、事故通知期限、甲方稽核權，
+    以及合約終止後個資返還或刪除義務。
+  adjusted_clause: 乙方應依個人資料保護法及甲方要求採取加密、存取控制、稽核紀錄等安全維護措施；發生個資事件時，應於 24 小時內通知甲方並配合補救；合約終止後應於甲方指定期限內返還或刪除全部個人資料。

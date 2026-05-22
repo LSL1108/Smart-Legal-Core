@@ -1,0 +1,129 @@
+# ============================================================
+# 採購合約專屬紅線規則
+# ============================================================
+
+# === 驗收標準模糊 ===
+- id: acceptance_criteria_vague
+  topic: 驗收
+  risk: High
+  type: deviation
+  applicable_contract_types: ["採購合約"]
+  match:
+    any_of:
+      - "由乙方認定"
+      - "依乙方認定"
+      - "依乙方判斷"
+      - "由乙方判斷"
+      - "經乙方確認"
+      - "依乙方確認"
+      - "依現況交付"
+      - "目視檢查"
+      - "外觀檢查"
+  context_required:
+    any_of: ["驗收", "交付", "點交", "完工", "完成"]
+  exclude:
+    near_terms: ["不得", "禁止", "排除"]
+    window: 8
+  analysis_template: |
+    本條驗收標準過於模糊，由乙方單方面認定（命中：{matched}），
+    甲方失去客觀檢驗依據，可能導致交付品質爭議。
+  suggestion: 建議明確列出驗收項目、檢驗方法、合格標準，並約定甲方有權派員或委託第三方檢驗。
+  adjusted_clause: 驗收應依雙方事前確認之檢驗清單與合格標準辦理，甲方得派員或委由第三方執行檢驗；不合格者乙方應於指定期限內無償補正。
+
+
+# === 保固期過短 ===
+- id: warranty_too_short
+  topic: 保固
+  risk: High
+  type: deviation
+  applicable_contract_types: ["採購合約"]
+  regex_match:
+    pattern: "保固.{0,15}?(?P<months>\\d+)\\s*(?:個月|月|month)"
+    threshold:
+      capture: months
+      op: "<"
+      value: 12  # 保固期 < 12 個月視為過短
+  analysis_template: |
+    本條約定保固期過短（命中：{matched}），低於常見的一年標準，
+    甲方在發現潛在瑕疵時可能已無法主張賠償。
+  suggestion: 建議至少 12 個月起跳，重要設備或軟體系統應 24 個月以上。
+  adjusted_clause: 本標的保固期間自驗收完成之日起算 12 個月；保固期內如發現瑕疵，乙方應無償修復或更換。
+
+
+# === 付款條件單方面 ===
+- id: payment_terms_unilateral
+  topic: 付款條件
+  risk: High
+  type: deviation
+  applicable_contract_types: ["採購合約"]
+  match:
+    any_of:
+      - "預付款"
+      - "預先付款"
+      - "簽約即付清"
+      - "簽約日全額"
+      - "簽約後一次"
+      - "前金"
+  context_required:
+    any_of: ["付款", "支付", "貨款", "價金"]
+  exclude:
+    near_terms: ["不得", "不接受", "禁止", "不採"]
+    window: 8
+  regex_match:
+    pattern: "(?:預付|前金).{0,10}?(?P<percent>\\d+)\\s*[%％]"
+    threshold:
+      capture: percent
+      op: ">"
+      value: 30
+  analysis_template: |
+    本條付款條件對甲方不利（命中：{matched}），預付比例過高將承擔
+    乙方無法履約或交付不合格時的資金風險。
+  suggestion: |
+    建議改為分期付款並與里程碑掛勾（簽約 30%、交付 50%、驗收合格 20%），
+    避免在驗收前預付過多比例。
+  adjusted_clause: 付款方式：簽約後 30%、交付完成後 50%、驗收合格後 20%；任一階段未達成者得暫停後續付款。
+
+
+# === 交付期限過長且無罰則 ===
+- id: delivery_no_penalty
+  topic: 交付期限
+  risk: Medium
+  type: deviation
+  applicable_contract_types: ["採購合約"]
+  match:
+    any_of:
+      - "盡力於"
+      - "預計於"
+      - "約於"
+      - "視情況交付"
+      - "依乙方安排"
+  context_required:
+    any_of: ["交付", "交貨", "出貨", "完成"]
+  exclude:
+    near_terms: ["不得", "排除"]
+    window: 6
+  analysis_template: |
+    本條交付期限缺乏約束力（命中：{matched}），乙方延遲時甲方無有效救濟工具。
+  suggestion: 建議改為「確切日期」或「簽約後 N 日內」，並約定逾期之每日違約金。
+  adjusted_clause: 乙方應於簽約後 60 日內完成交付；逾期每日按合約總價 0.1% 計算違約金，上限為合約總價 10%。
+
+
+# === 規格變更單方面權力 ===
+- id: spec_change_unilateral
+  topic: 規格變更
+  risk: High
+  type: deviation
+  applicable_contract_types: ["採購合約"]
+  match:
+    any_of:
+      - "乙方得逕行變更"
+      - "得逕行調整"
+      - "乙方有權變更"
+      - "視乙方安排"
+  context_required:
+    any_of: ["規格", "型號", "材質", "品牌", "等同品"]
+  analysis_template: |
+    本條允許乙方單方面變更規格（命中：{matched}），可能導致實際交付物
+    與甲方需求不符，且甲方無拒絕餘地。
+  suggestion: 建議改為「規格變更須經甲方事前書面同意」，並保留甲方拒絕變更或解除合約之權利。
+  adjusted_clause: 規格、型號、材質或品牌之任何變更，須經甲方事前書面同意；甲方得拒絕變更，乙方仍應依原規格履約。

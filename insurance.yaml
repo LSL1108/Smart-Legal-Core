@@ -1,0 +1,197 @@
+# ============================================================
+# 保險代理合約專屬紅線規則
+# 從原 services.py 內 14 個 elif 分支搬出來
+# ============================================================
+
+# === 授權範圍 ===
+- id: insurance_authorization_scope_oral
+  topic: 授權範圍
+  risk: High
+  type: deviation
+  applicable_contract_types: ["保險代理合約"]
+  match:
+    any_of:
+      - "口頭同意"
+      - "其他保險相關服務"
+      - "其他經甲方口頭或書面同意"
+      - "口頭授權"
+      - "口頭核准"
+  context_required:
+    any_of: ["授權", "代理", "招攬", "服務"]
+  exclude:
+    near_terms: ["不得", "禁止", "排除"]
+    window: 8
+  analysis_template: |
+    本條出現「{matched}」字眼，表示乙方授權範圍可能過寬，或以口頭同意擴張保險代理服務事項。
+    保險代理業務涉及高度監理，若未以書面明確約定授權事項，可能導致乙方越權招攬、承諾或處理保戶服務。
+  suggestion: 建議明確限定乙方授權範圍，涉及新增服務、通路或合作事項時，均應取得甲方事前書面同意。
+  adjusted_clause: 乙方辦理本合約以外之保險相關服務，應事前取得甲方書面同意，且不得逾越甲方明示授權範圍。
+
+
+# === 文件轉送期限 ===
+- id: insurance_document_transfer_vague
+  topic: 文件轉送期限
+  risk: High
+  type: deviation
+  applicable_contract_types: ["保險代理合約"]
+  match:
+    any_of:
+      - "合理期間"
+      - "儘速"
+      - "適當期間"
+      - "盡快"
+      - "適時"
+  context_required:
+    any_of: ["要保", "文件", "資料", "申請書", "轉送", "轉交"]
+  exclude:
+    near_terms: ["不得", "禁止", "並非"]
+    window: 8
+  analysis_template: |
+    本條出現「{matched}」等模糊期限，未明確規定乙方收受要保文件後應於幾日內轉送甲方。
+    文件轉送延遲可能影響核保、出單、通報及保戶權益。
+  suggestion: 建議將「合理期間」「儘速」等文字改為明確日數，並約定資料不完整時的補正通知義務。
+  adjusted_clause: 乙方應於收受客戶完整要保文件後三個工作日內轉送甲方核辦；如資料不全，應即時通知客戶補正。
+
+
+# === 廣告文宣控管 ===
+- id: insurance_advertising_post_review
+  topic: 廣告文宣控管
+  risk: High
+  type: deviation
+  applicable_contract_types: ["保險代理合約"]
+  match:
+    any_of:
+      - "事後備查"
+      - "事後通知"
+      - "得先行使用"
+      - "得先行刊登"
+      - "稍後送審"
+  context_required:
+    any_of: ["廣告", "文宣", "簡報", "商品說明", "社群", "行銷"]
+  exclude:
+    near_terms: ["不得", "禁止", "未經"]
+    window: 8
+  analysis_template: |
+    本條出現「{matched}」字眼，表示乙方可能未經甲方事前書面審核即先行使用廣告、簡報、社群貼文或商品文宣。
+    保險商品招攬文宣涉及消費者保護與不實招攬風險，若僅採事後備查，將增加甲方遭主管機關裁罰或保戶爭議之風險。
+  suggestion: 建議改為乙方製作或使用任何保險商品文宣、廣告、簡報、商品說明或社群內容前，均應先取得甲方書面同意。
+  adjusted_clause: 乙方使用任何保險商品文宣、廣告、簡報、商品說明或社群內容前，應事先取得甲方書面同意後始得使用。
+
+
+# === 佣酬返還 ===
+- id: insurance_commission_clawback_vague
+  topic: 佣酬返還
+  risk: High
+  type: deviation
+  applicable_contract_types: ["保險代理合約"]
+  match:
+    any_of:
+      - "得免返還"
+      - "不適用返還"
+      - "得不退還"
+      - "不予退費"
+  context_required:
+    any_of: ["佣酬", "佣金", "報酬", "解約", "退保", "退費"]
+  exclude:
+    near_terms: ["不得", "排除"]
+    window: 8
+  analysis_template: |
+    本條出現「{matched}」字眼，表示乙方在保戶解約或退保時可能不需返還已收佣金，
+    與保險業實務及監理慣例不符，可能造成甲方財務負擔。
+  suggestion: 建議明確約定佣酬返還機制：保戶於繳費年期內解約或退保時，乙方應依比例返還已收佣金。
+  adjusted_clause: 保戶於繳費年期內解約、退保或保單失效時，乙方應依保單實際有效期間比例返還已收佣金。
+
+
+# === 複委託監督 ===
+- id: insurance_subcontracting_no_consent
+  topic: 複委託監督
+  risk: High
+  type: deviation
+  applicable_contract_types: ["保險代理合約"]
+  match:
+    any_of:
+      - "得自行委託"
+      - "得轉委託"
+      - "外包予合作廠商"
+      - "得交由第三方"
+      - "得委託第三人"
+  context_required:
+    any_of: ["委託", "複委託", "外包", "代為處理"]
+  exclude:
+    near_terms: ["不得", "禁止", "未經", "事前"]
+    window: 8
+  analysis_template: |
+    本條出現「{matched}」字眼，表示乙方可將資料處理、客服、行銷分析等作業交由合作廠商執行，
+    但草稿未明確要求甲方事前書面同意、揭露複委託對象、監督受託者及承擔同等責任。
+  suggestion: 建議要求乙方複委託前須取得甲方事前書面同意，並對受託者之行為負同等責任。
+  adjusted_clause: 乙方如需複委託第三人處理本合約事項，應事前取得甲方書面同意，並確保受託者遵守本合約及相關法令，乙方並負同等責任。
+
+
+# === 洗錢防制與打擊資恐 ===
+- id: insurance_aml_cft_vague
+  topic: 洗錢防制與打擊資恐
+  risk: High
+  type: deviation
+  applicable_contract_types: ["保險代理合約"]
+  match:
+    any_of:
+      - "依一般商業慣例"
+      - "依合理範圍"
+      - "視情形配合"
+      - "盡力配合"
+  context_required:
+    any_of: ["洗錢", "AML", "CFT", "資恐", "客戶身分", "KYC"]
+  exclude:
+    near_terms: ["不得", "排除"]
+    window: 8
+  analysis_template: |
+    本條出現「{matched}」等模糊表述，表示乙方對客戶身分確認、風險辨識、資料補充及 AML/CFT 配合義務不足。
+    保險業務涉及洗錢防制與打擊資恐監理要求，不能僅以一般商業慣例或合理範圍帶過。
+  suggestion: 建議明確列入乙方應配合甲方辦理客戶身分確認、風險辨識、資料驗證、教育訓練及異常事項通報。
+  adjusted_clause: 乙方應遵守洗錢防制及打擊資恐相關法令，並配合甲方辦理客戶身分確認、風險辨識、資料驗證及必要通報作業。
+
+
+# === 終止事由模糊 ===
+- id: insurance_termination_clause_vague
+  topic: 終止事由
+  risk: High
+  type: deviation
+  applicable_contract_types: ["保險代理合約"]
+  match:
+    any_of:
+      - "經雙方協議"
+      - "視情況決定"
+      - "另行約定"
+      - "雙方合意終止"
+  context_required:
+    any_of: ["終止", "解除", "結束", "中止"]
+  exclude:
+    near_terms: ["不得", "禁止"]
+    window: 6
+  analysis_template: |
+    本條出現「{matched}」等模糊表述，表示甲方對乙方遭主管機關裁罰、證照撤銷、重大違法或保戶權益受損時的終止權不夠明確。
+    保險代理合約若終止事由過於籠統，可能使甲方在監理事件發生後無法即時暫停或終止合作。
+  suggestion: 建議明確列入證照撤銷、主管機關重大裁罰、重大違反保險法令、損害保戶權益及逾期未改善等終止事由。
+  adjusted_clause: 乙方有證照撤銷、重大違反保險法令、遭主管機關重大裁罰或損害保戶權益情事時，甲方得暫停或終止本合約。
+
+
+# === 損害賠償責任過度限縮 ===
+- id: insurance_liability_overlimited
+  topic: 損害賠償
+  risk: High
+  type: deviation
+  applicable_contract_types: ["保險代理合約"]
+  match:
+    any_of:
+      - "賠償上限為佣金總額"
+      - "以本年度佣酬為限"
+      - "不超過已收佣金"
+      - "上限以已付報酬"
+  context_required:
+    any_of: ["賠償", "責任", "損害"]
+  analysis_template: |
+    本條出現「{matched}」等責任限制字眼，可能使乙方就個資外洩、不實招攬、挪用保費、主管機關裁罰
+    或保戶損害之責任被過度限縮。
+    保險代理業務涉及消費者保護與金融監理，損害賠償上限若過低，將降低甲方追償與風險控管能力。
+  suggestion: 建議排除故意、重大過失、個資事件、違法招攬、挪用保費、主管機關裁罰及第三人求償等情形，不適用責任上限。
+  adjusted_clause: 乙方因故意、重大過失、違法招攬、個資事件、挪用保費或主管機關裁罰所生損害，不適用賠償責任上限。

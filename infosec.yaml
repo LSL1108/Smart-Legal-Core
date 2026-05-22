@@ -1,0 +1,148 @@
+# ============================================================
+# 資安合約專屬紅線規則
+# ============================================================
+
+# === Critical：拒絕配合資安檢測 ===
+- id: security_scan_refusal_critical
+  topic: 資安檢測與掃描
+  risk: Critical
+  type: conflict
+  applicable_contract_types: ["資安合約", "維護合約", "開發合約"]
+  match:
+    any_of:
+      - "拒絕配合"
+      - "免除資安責任"
+      - "概不負責"
+      - "無須配合弱點掃描"
+      - "不負責修補"
+      - "不配合檢測"
+      - "免除資安義務"
+  context_required:
+    any_of: ["資安", "弱掃", "弱點", "滲透", "資安事件", "資安檢測"]
+  analysis_template: |
+    本條出現「{matched}」等明確拒絕資安義務的字眼，與企業資安合規要求直接衝突。
+    特別是涉及金融、個資處理的系統，無法接受任何免除資安義務的條款。
+  suggestion: 必須移除這類免責條款，並明確約定乙方應配合甲方所要求的資安檢測、弱點修補與事件回應。
+  adjusted_clause: 乙方應全面配合甲方執行之資安檢測、弱點掃描、滲透測試，並於約定期限內完成修補；發生資安事件應立即通報並協助復原。
+
+
+# === High：資安檢測另行收費 ===
+- id: security_scan_extra_charge
+  topic: 資安檢測與掃描
+  risk: High
+  type: deviation
+  applicable_contract_types: ["資安合約", "維護合約", "開發合約"]
+  match:
+    any_of:
+      - "另行報價"
+      - "另行收費"
+      - "額外計費"
+      - "甲方另行負擔"
+      - "由甲方負擔"
+      - "得視情況"
+      - "得另行"
+      - "需付費"
+  context_required:
+    any_of: ["資安", "弱掃", "弱點", "滲透", "檢測", "修補", "稽核"]
+  exclude:
+    near_terms: ["不得", "不另", "已含", "包含於", "免費"]
+    window: 10
+  analysis_template: |
+    本條出現「{matched}」字眼，顯示資安檢測、弱點掃描或修補責任可能被改為另行收費或由甲方負擔，
+    將增加甲方資安成本與合規風險。
+  suggestion: |
+    建議明確約定乙方應配合資安檢測、弱點掃描與必要修補，並釐清費用是否已包含於合約價金內；
+    若需另計費，應明訂範圍、上限與啟動條件。
+  adjusted_clause: 乙方應配合甲方執行必要之資安檢測與弱點掃描，並依合約約定完成相關修補與回報，相關作業費用已包含於本合約總價內。
+
+
+# === 資安事件通報期限過長 ===
+- id: incident_notification_too_late
+  topic: 資安事件通報
+  risk: High
+  type: deviation
+  applicable_contract_types: ["資安合約", "維護合約"]
+  regex_match:
+    # 兩個 alternative：(事件後接通報時數) 或 (通報後接時數)
+    # 「個工作日」「個月」「日」要支援；用 [^，。] 限制不跨句子
+    pattern: "(?:資安事件|個資事件|資料外洩|事件)[^，。]{0,30}?(?P<n1>\\d+)\\s*(?:個工作日|工作日|小時|hour|hr|日|天)|(?:通知|通報)[^，。]{0,15}?(?P<n2>\\d+)\\s*(?:個工作日|工作日|小時|hour|hr|日|天)"
+    threshold:
+      capture: n1
+      op: ">"
+      value: 3   # 超過 3 個單位都嫌晚（無論單位是小時、日、工作日）
+  context_required:
+    any_of: ["事件", "通知", "通報", "外洩", "外流"]
+  analysis_template: |
+    本條約定的事件通報期限可能過長（命中：{matched}），不符合 GDPR、個資法等
+    主要法規對資安事件通報的時效要求（一般為 72 小時內）。
+  suggestion: 建議將通報期限調整為「發現後 24 小時內」或「不晚於 72 小時內」，並明確列出應通報事項。
+  adjusted_clause: 乙方發現資安或個資事件時，應於 24 小時內通知甲方，並於 72 小時內完成正式書面通報，包含事件範圍、影響評估及補救措施。
+
+
+# === 資安事件通報模糊 ===
+- id: incident_notification_vague
+  topic: 資安事件通報
+  risk: High
+  type: deviation
+  applicable_contract_types: ["資安合約", "維護合約"]
+  match:
+    any_of:
+      - "適當期間"
+      - "合理時間"
+      - "儘速通知"
+      - "盡快通知"
+      - "適時告知"
+  context_required:
+    any_of: ["資安事件", "個資事件", "事件", "外洩", "外流", "洩漏"]
+  exclude:
+    near_terms: ["不得", "禁止"]
+    window: 8
+  analysis_template: |
+    本條對資安事件通報期限規定模糊（命中：{matched}），無法確保甲方在事件發生後能即時掌握情況，
+    影響應變與通報主管機關時效。
+  suggestion: 建議明訂具體時數（如 24 小時內初步通知、72 小時內書面正式通報）。
+  adjusted_clause: 乙方發現資安事件時，應於 24 小時內以電話或電子郵件初步通知，並於 72 小時內提交正式書面通報。
+
+
+# === 弱點修補時限 ===
+- id: vuln_fix_no_deadline
+  topic: 弱點修補
+  risk: High
+  type: deviation
+  applicable_contract_types: ["資安合約", "維護合約"]
+  match:
+    any_of:
+      - "視情況"
+      - "另行協議"
+      - "得評估"
+      - "依乙方判斷"
+  context_required:
+    any_of: ["弱點", "漏洞", "修補", "patch", "更新"]
+  exclude:
+    near_terms: ["不得", "禁止"]
+    window: 6
+  analysis_template: |
+    本條對弱點修補期限未明確約定（命中：{matched}），可能導致已知漏洞長期未修補，
+    增加資安事件發生風險。
+  suggestion: 建議按 CVSS 等級分級約定修補時限（高 / 中 / 低）與例外處理機制。
+  adjusted_clause: 乙方應依弱點 CVSS 嚴重程度分級修補：高（CVSS ≥ 7.0）於 7 日內、中（4.0-6.9）於 30 日內、低於 90 日內完成修補；無法即時修補者應提出緩解措施。
+
+
+# === 資料備份缺漏 ===
+- id: backup_missing_or_vague
+  topic: 資料備份
+  risk: Medium
+  type: deviation
+  applicable_contract_types: ["資安合約", "維護合約"]
+  match:
+    any_of:
+      - "由甲方自行備份"
+      - "備份由甲方負責"
+      - "乙方不負備份責任"
+  context_required:
+    any_of: ["備份", "災難復原", "DR", "資料保留"]
+  analysis_template: |
+    本條將備份責任轉嫁甲方（命中：{matched}），對「乙方代管系統」的場景不合理，
+    甲方無法實際執行備份操作。
+  suggestion: 建議要求乙方執行定期備份（每日 / 每週）、保留期限、異地備份及還原測試。
+  adjusted_clause: 乙方應對本系統執行每日異地備份，保留期限不少於 30 日，並每季執行還原演練；備份失敗應立即通知甲方。

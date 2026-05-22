@@ -1,0 +1,159 @@
+# ============================================================
+# 維護合約專屬紅線規則
+# ============================================================
+
+# === 異常回覆時限 ===
+- id: response_time_vague
+  topic: 異常回覆時限
+  risk: High
+  type: deviation
+  applicable_contract_types: ["維護合約", "資安合約"]
+  match:
+    any_of:
+      - "兩個營業週期"
+      - "三個太陽日"
+      - "營業週期"
+      - "太陽日"
+      - "適當期間"
+      - "合理時間內"
+      - "儘速回覆"
+      - "盡可能回覆"
+  context_required:
+    any_of: ["異常", "故障", "回覆", "處理", "通報", "回應"]
+  exclude:
+    near_terms: ["不得", "禁止", "排除"]
+    window: 8
+  analysis_template: |
+    本條出現「{matched}」等不明確或過長的異常處理時限，可能導致系統發生中止、故障或服務阻礙時，
+    乙方無法即時回應與排除問題，影響甲方營運穩定。
+  suggestion: |
+    建議明確約定異常通報後的回覆時限（如 4 小時內）、初步處理時間、修復時限與升級通報機制，
+    避免使用「營業週期」「太陽日」等不明確或不利於甲方的表述。
+  adjusted_clause: 乙方應於接獲甲方異常通知後 4 小時內回覆並確認受理，並依嚴重程度於約定時限內完成修復；如無法於修復時限內排除，應提出升級通報與處理計畫。
+
+
+# === 異常回覆時限：規範時數過長（regex）===
+- id: response_time_too_long
+  topic: 異常回覆時限
+  risk: High
+  type: deviation
+  applicable_contract_types: ["維護合約", "資安合約"]
+  regex_match:
+    # 數字後可接「小時」並後面或前面伴隨「回覆/回應/受理/處理」
+    # 用兩個 alternative：(數字+小時 後面有回覆) 或 (回覆 後面有數字+小時)
+    pattern: "(?:(?P<hours1>\\d+)\\s*(?:小時|hour|hr)[^，。]{0,15}?(?:回覆|回應|受理|處理|通報))|(?:(?:回覆|回應|受理|處理|通報)[^，。]{0,15}?(?P<hours2>\\d+)\\s*(?:小時|hour|hr))"
+    threshold:
+      capture: hours1   # 主要 capture；regex engine 會先抓到第一個 alternative
+      op: ">"
+      value: 24
+  context_required:
+    any_of: ["異常", "故障", "通報", "事件"]
+  analysis_template: |
+    本條約定回覆時限超過 24 小時（命中：{matched}），對營運級系統而言過長，
+    可能在重大事故發生時造成業務中斷。
+  suggestion: 建議依事件嚴重程度分級設定回覆時限，重大事故應於 4 小時內回覆，一般事件不超過 24 小時。
+  adjusted_clause: 乙方應依事件嚴重程度分級回覆：重大事故於 4 小時內、一般事件於 24 小時內回覆並提出處理計畫。
+
+
+# === 維護人力 ===
+- id: workforce_informal_personnel
+  topic: 維護人力
+  risk: High
+  type: deviation
+  applicable_contract_types: ["維護合約", "開發合約", "資安合約"]
+  match:
+    any_of:
+      - "見習"
+      - "在學"
+      - "建教"
+      - "建教合作"
+      - "建教合作培訓專員"
+      - "培訓專員"
+      - "專案見習員"
+      - "實習生"
+      - "工讀生"
+      - "兼職人員"
+      - "臨時工"
+      - "第一線專屬溝通橋樑"
+  context_required:
+    any_of: ["維護", "維運", "故障", "技術支援", "服務支援", "工程師", "窗口", "第一線"]
+  exclude:
+    near_terms: ["不得指派", "不得由", "排除", "禁止", "不得安排"]
+    window: 10
+  analysis_template: |
+    本條出現「{matched}」等字眼，且涉及維護或服務支援語境，
+    顯示乙方可能以見習、建教合作或非正式專業人員作為主要服務人力，
+    與企業對正式授權窗口、責任歸屬及專業支援之期待不符。
+  suggestion: |
+    建議要求乙方指派具相關經驗與資格之正式工程師、專案經理或正式授權窗口負責協處與聯繫，
+    並明確約定人員資格、替換機制與責任歸屬。
+  adjusted_clause: 乙方應指派具相關經驗與資格之正式工程師、專案經理或授權窗口負責本專案；不得以見習生、建教合作學生或實習人員作為主要服務人力。
+
+
+# === 維護時段不明確 ===
+- id: maintenance_window_vague
+  topic: 維護時間
+  risk: Medium
+  type: deviation
+  applicable_contract_types: ["維護合約"]
+  match:
+    any_of:
+      - "視情況而定"
+      - "由乙方安排"
+      - "另行安排"
+      - "不定時"
+  context_required:
+    any_of: ["維護", "維運", "服務時間", "工時"]
+  exclude:
+    near_terms: ["不得", "不可"]
+    window: 6
+  analysis_template: |
+    本條對維護時段的描述過於模糊（命中：{matched}），未約定固定服務時段或緊急支援機制，
+    可能影響甲方系統的可用性與計畫性維護。
+  suggestion: 建議明確約定平日服務時段、假日支援方式，及緊急事故的 24 小時支援機制。
+  adjusted_clause: 乙方應於每週一至週五 09:00-18:00 提供維護服務；遇緊急事故，應提供 24 小時聯絡窗口與支援機制。
+
+
+# === 修復時限：得另行協議 ===
+- id: fix_time_open_ended
+  topic: 修復時限
+  risk: High
+  type: deviation
+  applicable_contract_types: ["維護合約", "資安合約"]
+  match:
+    any_of:
+      - "得另行協議"
+      - "另行協商"
+      - "雙方協議定之"
+      - "視情況決定"
+  context_required:
+    any_of: ["修復", "排除", "解決", "復原"]
+  analysis_template: |
+    本條未明確約定修復時限（命中：{matched}），導致乙方無時間壓力，
+    可能造成故障長期未排除影響甲方營運。
+  suggestion: 建議按事故嚴重程度分級約定具體修復時限（小時 / 工作日），並明訂逾期之違約後果。
+  adjusted_clause: 乙方應於約定時限內完成修復：重大故障 24 小時內、一般故障 5 工作日內；逾期未排除應依違約金條款計算違約罰款。
+
+
+# === 智慧財產權歸屬模糊 ===
+- id: ip_ownership_vague
+  topic: 智慧財產權
+  risk: High
+  type: deviation
+  applicable_contract_types: ["維護合約", "開發合約"]
+  match:
+    any_of:
+      - "雙方共有"
+      - "共同擁有"
+      - "另行協議"
+      - "依個案而定"
+  context_required:
+    any_of: ["智慧財產權", "智財權", "著作權", "原始碼", "程式碼", "成果"]
+  exclude:
+    near_terms: ["不得", "排除"]
+    window: 8
+  analysis_template: |
+    本條對智慧財產權歸屬規定不明確（命中：{matched}），可能導致後續成果使用、修改、移轉
+    產生爭議，影響甲方對系統的長期掌控權。
+  suggestion: 建議明確約定客製化開發成果歸甲方所有，乙方原有共通模組可保留所有權但需授權甲方無償永久使用。
+  adjusted_clause: 乙方為履行本合約所開發之客製化程式、文件及成果，其智慧財產權歸甲方所有；乙方原有之共通模組或基礎工具仍屬乙方所有，但應授權甲方於使用本系統之必要範圍內無償永久使用。
