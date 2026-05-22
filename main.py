@@ -28,7 +28,6 @@ from database import (
 from intent_detector import detect_intent
 
 
-# 初始化 FastAPI 應用程式
 app = FastAPI(
     title="企業智能法務中樞 API",
     description="提供合規檢核、報價風險分析與合約生成之核心服務",
@@ -36,7 +35,16 @@ app = FastAPI(
 )
 
 
-# Request Models
+@app.on_event("startup")
+def _warmup_reranker_on_startup():
+    try:
+        import threading
+        from reranker import warmup
+        threading.Thread(target=warmup, name="reranker-warmup", daemon=True).start()
+    except Exception as e:
+        logging.warning("Reranker warmup 啟動失敗（不影響系統運作）: %s", e)
+
+
 class ReviewRequest(BaseModel):
     draft_text: str
     top_k: int = 5
@@ -51,13 +59,7 @@ class GenerateRequest(BaseModel):
 
 
 def should_use_review_context(user_input: str) -> bool:
-    """
-    判斷使用者這次聊天是否真的需要沿用前一次合約審查上下文。
 
-    目的：
-    避免使用者只是問一般問題，例如「資安檢測是什麼」，
-    系統卻把它誤當成合約缺漏或審查依據。
-    """
     if not user_input:
         return False
 
@@ -87,9 +89,6 @@ def should_use_review_context(user_input: str) -> bool:
 # API Endpoints
 @app.post("/api/review", response_model=ReviewReport, summary="動態語義合約審查")
 def api_review_contract(request: ReviewRequest):
-    """
-    接收合約草稿文本，調用 RAG 向量檢索與 LLM 進行逐條審查，回傳完整的風險報告。
-    """
     if not request.draft_text.strip():
         raise HTTPException(status_code=400, detail="草稿內容不能為空")
 
@@ -285,9 +284,6 @@ def api_review_contract_stream(request: ReviewRequest):
 
 @app.post("/api/risk", summary="歷史報價風險預警")
 def api_assess_risk(request: RiskRequest):
-    """
-    分析使用者輸入中的廠商名稱與報價金額，比對歷史資料庫並回傳風險評估報告。
-    """
     if not request.user_input.strip():
         raise HTTPException(status_code=400, detail="輸入內容不能為空")
 
@@ -309,10 +305,7 @@ def api_assess_risk(request: RiskRequest):
 
 @app.post("/api/generate", summary="自動合約套版生成")
 def api_generate_contract(request: GenerateRequest):
-    """
-    解析使用者意圖，尋找對應基準文件，並將參數套入 DOCX 生成合約實體檔案。
-    回傳生成的檔案路徑。
-    """
+
     if not request.user_input.strip():
         raise HTTPException(status_code=400, detail="輸入內容不能為空")
 
@@ -322,10 +315,8 @@ def api_generate_contract(request: GenerateRequest):
 
         selector = parse_template_selector(request.user_input)
 
-        # 先嘗試用使用者指定的模板選擇器找，例如「用第 2 份模板」
         base = get_template_by_selector(selector)
 
-        # 如果沒有指定模板，再用 query_text + filters 搜尋
         if not base:
             candidates = search_templates_sql(
                 query_text=request.user_input,
@@ -376,14 +367,7 @@ def api_generate_contract(request: GenerateRequest):
 
 @app.post("/api/chat", summary="法務助理自由對話")
 def api_chat_assistant(request: ChatRequest):
-    """
-    接收前端的對話紀錄與當前合約上下文，交由聊天服務入口處理。
 
-    設計重點：
-    1. intent_detector 先判斷是否需要帶入 review_context / draft_text。
-    2. answer_contract_chat 統一處理 timeout、latency 與 tool metadata。
-    3. 補條款問題會由 clause_followup_service deterministic 處理。
-    """
     try:
         messages_dict = [
             {"role": m.role, "content": m.content}
@@ -401,15 +385,10 @@ def api_chat_assistant(request: ChatRequest):
         effective_review_context = request.review_context
         effective_draft_text = request.draft_text
 
-        # 一般聊天與資安概念解釋：
-        # 不使用前一次審查結果，也不使用目前上傳的合約草稿
         if intent in ["chat", "security_explanation"]:
             effective_review_context = None
             effective_draft_text = ""
 
-        # 其他情況：
-        # 若使用者沒有明確提到「這份合約 / 剛剛的審查」，
-        # 不自動沿用 review_context
         elif not should_use_review_context(latest_user_input):
             effective_review_context = None
 
@@ -446,12 +425,8 @@ def api_chat_assistant(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 企業智庫管理 API
 @app.post("/api/upload", summary="批次上傳企業基準入庫")
 def api_upload_template(files: List[UploadFile] = File(...)):
-    """
-    接收前端傳來的檔案，並轉交給服務層進行向量化入庫。
-    """
 
     class DummyFile:
         def __init__(self, name, content):
@@ -485,9 +460,7 @@ def api_upload_template(files: List[UploadFile] = File(...)):
 
 @app.delete("/api/templates/{doc_id}", summary="永久刪除基準檔案")
 def api_delete_template(doc_id: str):
-    """
-    接收前端的刪除指令，清除 SQLite 與 ChromaDB 中的資料。
-    """
+
     from database import (
         template_collection,
         chunk_collection,

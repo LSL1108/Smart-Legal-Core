@@ -11,9 +11,29 @@ from difflib import SequenceMatcher
 import chromadb
 from chromadb.utils import embedding_functions
 from utils import detect_topics, parse_core_topics_field, detect_clause_type, normalize_text
-from config import SQLITE_DB_PATH, CHROMA_DIR, EMBED_MODEL, TOPIC_KEYWORDS, TOPIC_ALIAS
+from config import (
+    SQLITE_DB_PATH,
+    CHROMA_DIR,
+    EMBED_MODEL,
+    TOPIC_KEYWORDS,
+    TOPIC_ALIAS,
+    OLLAMA_EMBED_URL,
+    BM25_TOP_K,
+    DENSE_TOP_K,
+    HYBRID_TOP_K,
+    RRF_K,
+    ENABLE_RERANKER,
+    RERANKER_INPUT_K,
+    RERANKER_TOP_K,
+)
+from retrieval import (
+    HybridIndex,
+    get_hybrid_index,
+    reciprocal_rank_fusion,
+    HYBRID_RETRIEVAL_AVAILABLE,
+)
+from reranker import rerank as _cross_encoder_rerank, is_available as _reranker_available
 
-# ★ 預設法遵規則庫 
 DEFAULT_COMPLIANCE_RULES: Dict[str, List[str]] = {
     "資安檢測與掃描": [
         "廠商應協助進行弱點掃描",
@@ -63,13 +83,12 @@ DEFAULT_COMPLIANCE_RULES: Dict[str, List[str]] = {
         "保險代理人有證照撤銷、主管機關重大裁罰、重大違反保險法令或損害保戶權益情事時，保險業得暫停或終止合約",
     ],
 }
-# === Topic Filter Helper Functions ===
+
 
 _TOPIC_FILTER_MIN_MATCH = 1
 
 
 def _topic_filter_terms(target_topic: str) -> List[str]:
-    """取得 target_topic 對應的 topic、alias、keywords，用於 RAG chunk topic guard。"""
     target_topic = str(target_topic or "").strip()
     if not target_topic:
         return []
@@ -90,7 +109,6 @@ def _topic_filter_terms(target_topic: str) -> List[str]:
 
 
 def _ref_topic_text(ref: Dict[str, Any]) -> str:
-    """彙整 chunk metadata 與內容中可判斷 topic 的文字。"""
     parts: List[str] = []
     for key in ["topics", "core_topics"]:
         value = ref.get(key, "")
@@ -112,7 +130,6 @@ def _ref_topic_text(ref: Dict[str, Any]) -> str:
 
 
 def _topic_match_score(ref: Dict[str, Any], target_topic: str) -> int:
-    """計算 chunk 是否與指定 topic 相符。metadata topic 命中給較高權重。"""
     terms = _topic_filter_terms(target_topic)
     if not terms:
         return 0
@@ -137,12 +154,7 @@ def _topic_match_score(ref: Dict[str, Any], target_topic: str) -> int:
 
 
 def filter_chunks_by_topic(refs: List[Dict[str, Any]], target_topic: str) -> List[Dict[str, Any]]:
-    """
-    依 target_topic 優先篩選 RAG 片段。
 
-    目的：避免「文件對了、條文錯了」，例如缺漏保密措施卻引用到招攬義務。
-    若完全沒有命中，保留原 refs 作為 fallback，避免因 topic metadata 不完整而查不到資料。
-    """
     target_topic = str(target_topic or "").strip()
     if not refs or not target_topic:
         return refs
@@ -166,6 +178,13 @@ def filter_chunks_by_topic(refs: List[Dict[str, Any]], target_topic: str) -> Lis
 def get_db():
     conn = sqlite3.connect(SQLITE_DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+
+    try:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
+    except sqlite3.Error as e:
+        logging.warning("SQLite PRAGMA 設定失敗: %s", e)
     try:
         yield conn
         conn.commit()
@@ -247,8 +266,19 @@ def row_to_template_dict(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
     if row is None:
         return {}
     d = dict(row)
-    d["keywords"]    = json.loads(d["keywords"])    if d.get("keywords")    else []
-    d["core_topics"] = json.loads(d["core_topics"]) if d.get("core_topics") else []
+
+    def _safe_json_list(value: Any) -> List[Any]:
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, TypeError) as exc:
+            logging.warning("template row JSON 欄位解析失敗 (doc_id=%s): %s", d.get("doc_id"), exc)
+            return []
+
+    d["keywords"]    = _safe_json_list(d.get("keywords"))
+    d["core_topics"] = _safe_json_list(d.get("core_topics"))
     return d
 
 
@@ -318,6 +348,10 @@ def get_all_templates() -> List[Dict[str, Any]]:
 def delete_template_by_doc_id(doc_id: str):
     with get_db() as conn:
         conn.execute("DELETE FROM templates WHERE doc_id = ?", (doc_id,))
+    try:
+        get_hybrid_index().mark_dirty()
+    except Exception:
+        pass
 
 
 def search_templates_sql(
@@ -327,11 +361,6 @@ def search_templates_sql(
     contract_type: str = "",
     query: str = "",
 ) -> List[Dict[str, Any]]:
-    """
-    支援新舊兩種呼叫方式：
-    - 舊版：search_templates_sql(contract_type=..., query=..., limit=...)
-    - 新版：search_templates_sql(query_text=..., filters={...}, limit=...)
-    """
     effective_query = (query_text or query or "").strip()
     filters = dict(filters or {})
 
@@ -499,7 +528,6 @@ def insert_compliance_rule(topic: str, example: str) -> int:
 
 
 def upsert_compliance_rule(topic: str, examples: List[str]):
-    """前端傳入一個主題與多個範例，更新該主題的所有規則（先軟刪除舊的再新增）。"""
     with get_db() as conn:
         conn.execute(
             "UPDATE compliance_rules SET is_active = 0, updated_at = datetime('now','localtime') WHERE topic = ?",
@@ -514,7 +542,7 @@ def upsert_compliance_rule(topic: str, examples: List[str]):
 
 
 def delete_compliance_rule(topic: str) -> bool:
-    """軟刪除：將該主題的所有規則標記為停用，保留歷史紀錄。"""
+
     with get_db() as conn:
         cur = conn.execute(
             "UPDATE compliance_rules SET is_active = 0, "
@@ -534,15 +562,15 @@ def list_all_compliance_rules() -> List[Dict[str, Any]]:
 
 
 def seed_compliance_rules_if_empty():
+
     with get_db() as conn:
         count = conn.execute(
             "SELECT COUNT(*) FROM compliance_rules"
         ).fetchone()[0]
 
-    if count > 0:
-        return
+        if count > 0:
+            return
 
-    with get_db() as conn:
         conn.executemany(
             "INSERT INTO compliance_rules (topic, example) VALUES (?, ?)",
             [
@@ -567,7 +595,7 @@ def get_chroma():
     client = chromadb.PersistentClient(path=CHROMA_DIR)
 
     ollama_ef = embedding_functions.OllamaEmbeddingFunction(
-        url="http://localhost:11434/api/embeddings",
+        url=OLLAMA_EMBED_URL,
         model_name=EMBED_MODEL,
     )
 
@@ -604,7 +632,6 @@ if not os.environ.get("SKIP_DB_INIT"):
 # === Chunk Helper Functions ===
 
 def _stable_chunk_id(doc_id: str, parent_article_key: str, chunk_index: int, content: str) -> str:
-    """產生穩定 chunk id，避免同一文件重建索引時追蹤來源失準。"""
     seed = "\n".join([
         str(doc_id or ""),
         str(parent_article_key or ""),
@@ -616,7 +643,7 @@ def _stable_chunk_id(doc_id: str, parent_article_key: str, chunk_index: int, con
 
 
 def _metadata_str(value: Any) -> str:
-    """Chroma metadata 僅存純量；此函式統一轉成安全字串。"""
+
     if value is None:
         return ""
     if isinstance(value, (list, tuple, set)):
@@ -665,7 +692,7 @@ _DEDUP_HIGH_SIMILARITY_THRESHOLD = 0.98
 
 
 def _normalize_text_for_dedup(text: str) -> str:
-    """供去重使用：壓縮空白與換行，避免同一段文字因格式差異被視為不同。"""
+
     return " ".join(normalize_text(text or "").split())
 
 
@@ -689,12 +716,7 @@ def _ref_dedup_key(ref: Dict[str, Any]) -> Tuple[str, str, str, str]:
 
 
 def _dedup_chunk_refs(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    移除重複或幾乎相同的檢索片段。
 
-    目的：避免同一條歷史合約因向量檢索與 keyword fallback 同時命中，
-    造成後續 LLM 看到大量重複 context，進而放大單一來源的影響。
-    """
     seen_keys = set()
     kept: List[Dict[str, Any]] = []
     seen_hashes = set()
@@ -729,7 +751,7 @@ def _dedup_chunk_refs(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _metadata_relevance_bonus(ref: Dict[str, Any], keywords: List[str]) -> int:
-    """根據條文標題、主題、條款類型、chunk_label 給額外分數。"""
+
     if not keywords:
         return 0
 
@@ -813,11 +835,6 @@ def _mmr_select_refs(
 # Vector DB Operations
 
 def upsert_template_vectors(meta: Dict[str, Any], full_text: str, chunks: List[Any]):
-    """
-    支援兩種 chunks 格式：
-    1. 舊版 List[str]
-    2. 新版 article-aware List[Dict[str, Any]]
-    """
     ensure_db()
     try:
         template_collection.upsert(
@@ -940,6 +957,8 @@ def upsert_template_vectors(meta: Dict[str, Any], full_text: str, chunks: List[A
             documents=[x["content"] for x in normalized_chunks],
             metadatas=[x["metadata"] for x in normalized_chunks],
         )
+        # 通知 hybrid retrieval 索引重建
+        get_hybrid_index().mark_dirty()
     except Exception as e:
         logging.error("歷史基準片段向量入庫失敗: %s", e)
 
@@ -984,6 +1003,42 @@ def query_templates_fulltext(draft_text: str, n_results: int = 12) -> List[Dict[
     return refs
 
 
+def _ensure_hybrid_index_built() -> None:
+
+    if not HYBRID_RETRIEVAL_AVAILABLE:
+        return
+
+    idx = get_hybrid_index()
+    if not idx.is_dirty and not idx.is_empty():
+        return
+
+    ensure_db()
+
+    try:
+        result = chunk_collection.get(include=["documents", "metadatas"])
+        ids = result.get("ids", []) or []
+        docs = result.get("documents", []) or []
+        metas = result.get("metadatas", []) or []
+    except Exception as exc:
+        logging.error("HybridIndex 重建失敗（chunk_collection.get）：%s", exc)
+        return
+
+    chunks = []
+    for i in range(len(ids)):
+        content = docs[i] if i < len(docs) else ""
+        meta = metas[i] if i < len(metas) else {}
+        if not content:
+            continue
+        chunks.append({
+            "id": ids[i],
+            "content": content,
+            "metadata": meta or {},
+        })
+
+    idx.build(chunks)
+    logging.info("HybridIndex 已重建，共 %d 個 chunk", idx.size())
+
+
 def query_template_chunks_by_query(
     query_text: str,
     candidate_doc_ids: List[str],
@@ -1000,6 +1055,14 @@ def query_template_chunks_by_query(
         topics = [t for t in str(topics_raw).split(",") if t.strip()]
         core_topics_raw = meta.get("core_topics", "")
         core_topics = [t for t in str(core_topics_raw).split(",") if t.strip()]
+
+        # is_vetted_clause 在 metadata 內存的可能是 bool / int / str；統一為 bool
+        vetted_raw = meta.get("is_vetted_clause", False)
+        if isinstance(vetted_raw, str):
+            is_vetted = vetted_raw.lower() in ("true", "1", "yes")
+        else:
+            is_vetted = bool(vetted_raw)
+
         return {
             "doc_id": meta.get("doc_id"),
             "file_name": meta.get("file_name", "未知檔案"),
@@ -1021,6 +1084,9 @@ def query_template_chunks_by_query(
             "maintenance_type": meta.get("maintenance_type", ""),
             "industry": meta.get("industry", ""),
             "contract_name": meta.get("contract_name", ""),
+            # 條款庫上架資訊（v2 新增）
+            "is_vetted_clause": is_vetted,
+            "clause_role": str(meta.get("clause_role", "") or ""),
         }
 
     def _extract_keywords(text: str) -> List[str]:
@@ -1055,68 +1121,93 @@ def query_template_chunks_by_query(
 
     refs: List[Dict[str, Any]] = []
     seen_keys = set()
+    dense_ranking: List[str] = []
+    chunk_pool: Dict[str, Dict[str, Any]] = {}
 
+    # ---- Step 1: Dense vector retrieval (BGE-M3 via Chroma) ----
     try:
         results = chunk_collection.query(
             query_texts=[query_text[:2000]],
-            n_results=max(n_results * 2, 12),
+            n_results=max(DENSE_TOP_K, n_results * 2, 12),
             where={"doc_id": {"$in": candidate_doc_ids}},
         )
 
+        ids = (results or {}).get("ids", [[]])
         docs = (results or {}).get("documents", [[]])
         metas = (results or {}).get("metadatas", [[]])
 
         if docs and docs[0]:
             for i, doc_text in enumerate(docs[0]):
                 meta = metas[0][i] if metas and metas[0] and i < len(metas[0]) and metas[0][i] else {}
+                cid = ids[0][i] if ids and ids[0] and i < len(ids[0]) else f"dense_{i}"
                 ref = _normalize_chunk_ref(doc_text, meta)
-                key = (ref["doc_id"], ref["content"][:120])
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                refs.append(ref)
+                ref["_chunk_id"] = cid
+                chunk_pool[cid] = ref
+                dense_ranking.append(cid)
     except Exception as e:
         logging.error("歷史基準片段向量檢索失敗: %s", e)
 
-    keywords = _extract_keywords(query_text)
-    if keywords:
-        try:
-            kw_results = chunk_collection.get(
-                where={"doc_id": {"$in": candidate_doc_ids}},
-                include=["documents", "metadatas"],
+    # ---- Step 2: BM25 sparse retrieval (透過 HybridIndex) ----
+    bm25_ranking: List[str] = []
+    try:
+        if HYBRID_RETRIEVAL_AVAILABLE:
+            _ensure_hybrid_index_built()
+            hybrid_idx = get_hybrid_index()
+            bm25_hits = hybrid_idx.bm25_search(
+                query_text,
+                top_k=max(BM25_TOP_K, n_results * 2),
+                candidate_doc_ids=candidate_doc_ids,
             )
-            kw_docs = (kw_results or {}).get("documents", [])
-            kw_metas = (kw_results or {}).get("metadatas", [])
-
-            lexical_hits = []
-            for i, doc_text in enumerate(kw_docs):
-                meta = kw_metas[i] if kw_metas and i < len(kw_metas) and kw_metas[i] else {}
-                norm_doc = normalize_text(doc_text)
-                topic_text = normalize_text(str(meta.get("topics", "")))
-                title_text = normalize_text(str(meta.get("article_title", "")))
-                clause_type_text = normalize_text(str(meta.get("clause_type", "")))
-                label_text = normalize_text(str(meta.get("chunk_label", "")))
-                searchable = " ".join([norm_doc, topic_text, title_text, clause_type_text, label_text])
-                hit_count = sum(1 for kw in keywords if kw in searchable)
-                if hit_count <= 0:
+            for chunk, _score in bm25_hits:
+                cid = chunk.get("id") or ""
+                if not cid:
                     continue
+                if cid not in chunk_pool:
+                    # BM25 命中但 dense 沒命中：把它加到 pool
+                    meta = chunk.get("metadata", {}) or {}
+                    ref = _normalize_chunk_ref(chunk.get("content", ""), meta)
+                    ref["_chunk_id"] = cid
+                    chunk_pool[cid] = ref
+                bm25_ranking.append(cid)
+    except Exception as e:
+        logging.warning("BM25 檢索失敗，僅使用向量結果: %s", e)
 
-                ref = _normalize_chunk_ref(doc_text, meta)
-                title_bonus = sum(2 for kw in keywords if kw in title_text or kw in label_text)
-                topic_bonus = sum(3 for kw in keywords if kw in topic_text or kw in clause_type_text)
-                lexical_hits.append((hit_count + title_bonus + topic_bonus, ref))
+    # ---- Step 3: 合併排序 (Reciprocal Rank Fusion) ----
+    if bm25_ranking:
+        fused = reciprocal_rank_fusion(
+            [dense_ranking, bm25_ranking],
+            k=RRF_K,
+        )
+        ordered_ids = [cid for cid, _ in fused]
+    else:
+        # BM25 不可用時退回純 dense（必要時可加上舊版 keyword fallback，但 hybrid 通常已足夠）
+        ordered_ids = dense_ranking
 
-            lexical_hits.sort(key=lambda x: x[0], reverse=True)
+    for cid in ordered_ids:
+        ref = chunk_pool.get(cid)
+        if not ref:
+            continue
+        key = (ref["doc_id"], ref["content"][:120])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        refs.append(ref)
+        if len(refs) >= max(HYBRID_TOP_K, n_results * 2):
+            break
 
-            for _, ref in lexical_hits[: max(n_results, 8)]:
-                key = (ref["doc_id"], ref["content"][:120])
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                refs.append(ref)
+    if ENABLE_RERANKER and refs:
+        rerank_input_k = max(RERANKER_INPUT_K, n_results * 2)
+        rerank_output_k = max(RERANKER_TOP_K, n_results)
+        head = refs[:rerank_input_k]
+        tail = refs[rerank_input_k:]
+        head_reranked = _cross_encoder_rerank(
+            query=query_text,
+            candidates=head,
+            top_k=rerank_output_k,
+        )
+        refs = list(head_reranked) + list(tail)
 
-        except Exception as e:
-            logging.warning("歷史基準片段 keyword 補召回失敗: %s", e)
+    keywords = _extract_keywords(query_text)
 
     refs = _dedup_chunk_refs(refs)
 
@@ -1127,3 +1218,82 @@ def query_template_chunks_by_query(
 
     refs = _mmr_select_refs(refs, keywords=keywords, top_n=n_results, lambda_=0.65)
     return refs[:n_results]
+
+
+
+def set_template_vetted_status(
+    doc_id: str,
+    is_vetted: bool,
+    clause_role: str = "core",
+) -> int:
+
+    ensure_db()
+    try:
+        result = chunk_collection.get(where={"doc_id": doc_id}, include=["metadatas"])
+        ids = result.get("ids", []) or []
+        metas = result.get("metadatas", []) or []
+        if not ids:
+            return 0
+
+        new_metas = []
+        for old_meta in metas:
+            new_meta = dict(old_meta or {})
+            new_meta["is_vetted_clause"] = bool(is_vetted)
+            new_meta["clause_role"] = str(clause_role or "core")
+            new_metas.append(new_meta)
+
+        # Chroma 的 update 只動 metadata，不重 embed
+        chunk_collection.update(ids=ids, metadatas=new_metas)
+        get_hybrid_index().mark_dirty()
+        logging.info(
+            "已將 doc_id=%s 的 %d 個 chunk 標記 is_vetted_clause=%s",
+            doc_id, len(ids), is_vetted,
+        )
+        return len(ids)
+    except Exception as exc:
+        logging.error("set_template_vetted_status 失敗: %s", exc)
+        return 0
+
+
+def get_template_vetted_status(doc_id: str) -> bool:
+
+    ensure_db()
+    try:
+        result = chunk_collection.get(
+            where={"doc_id": doc_id},
+            include=["metadatas"],
+            limit=1,
+        )
+        metas = result.get("metadatas", []) or []
+        if not metas:
+            return False
+        meta = metas[0] or {}
+        v = meta.get("is_vetted_clause", False)
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        return bool(v)
+    except Exception as exc:
+        logging.warning("get_template_vetted_status 失敗: %s", exc)
+        return False
+
+
+def list_vetted_doc_ids(contract_type: Optional[str] = None) -> List[str]:
+    """列出全部 vetted 的 doc_id，可依 contract_type 過濾。"""
+    ensure_db()
+    where: Dict[str, Any] = {"is_vetted_clause": True}
+    if contract_type:
+        where = {"$and": [{"is_vetted_clause": True}, {"contract_type": contract_type}]}
+    try:
+        result = chunk_collection.get(where=where, include=["metadatas"])
+        metas = result.get("metadatas", []) or []
+        seen: set = set()
+        out: List[str] = []
+        for m in metas:
+            doc_id = (m or {}).get("doc_id")
+            if doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                out.append(doc_id)
+        return out
+    except Exception as exc:
+        logging.warning("list_vetted_doc_ids 失敗: %s", exc)
+        return []

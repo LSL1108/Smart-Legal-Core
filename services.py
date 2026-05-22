@@ -3,6 +3,7 @@ import re
 import time
 import datetime
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Tuple, Optional
 from models import UserRequestIntent, ReviewReport
@@ -21,6 +22,15 @@ from config import (
     CRITICAL_RISK_TRIGGERS,
     HIGH_RISK_TRIGGERS,
     CONTRACT_TYPE_RULESET,
+    OLLAMA_URL,
+    LLM_NUM_CTX,
+    LLM_TIMEOUT_SEC,
+    OLLAMA_MAX_CONCURRENCY,
+    MAX_ARTICLE_CHARS,
+    MAX_CHUNK_CHARS,
+    MAX_PROMPT_CHARS,
+    MAX_QUERY_CHARS,
+    MAX_INGEST_CHARS,
 )
 
 from utils import (
@@ -46,7 +56,30 @@ from database import (
 )
 
 from clause_followup_service import answer_clause_followup
-# Ollama
+
+from text_normalize import ensure_traditional, ensure_traditional_in_obj
+
+from rule_engine import (
+    load_rules,
+    evaluate_all_rules,
+    render_issue_from_hit,
+    merge_issues_by_topic,
+)
+
+
+
+_ollama_client = ollama.Client(host=OLLAMA_URL, timeout=LLM_TIMEOUT_SEC)
+_ollama_semaphore = threading.Semaphore(OLLAMA_MAX_CONCURRENCY)
+
+
+def _truncate(text: str, limit: int, suffix: str = "...(已截斷)") -> str:
+    if not text:
+        return ""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + suffix
+
 
 def ollama_json(
     prompt: str,
@@ -54,22 +87,30 @@ def ollama_json(
     temperature: float = 0.0,
     top_p: float = 0.1,
     retries: int = 2,
+    num_ctx: Optional[int] = None,
 ) -> Dict[str, Any]:
+    prompt = _truncate(prompt.strip(), MAX_PROMPT_CHARS)
+    effective_num_ctx = num_ctx or LLM_NUM_CTX
+
     for attempt in range(retries + 1):
         try:
             logging.info(f"ollama_json 使用模型：{model}")
 
-            res = ollama.generate(
-                model=model,
-                prompt=prompt.strip(),
-                format="json",
-                options={
-                    "temperature": temperature,
-                    "top_p": top_p,
-                },
-            )
+            with _ollama_semaphore:
+                res = _ollama_client.generate(
+                    model=model,
+                    prompt=prompt,
+                    format="json",
+                    options={
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "num_ctx": effective_num_ctx,
+                    },
+                )
 
-            return safe_json_load((res or {}).get("response", "{}"))
+            return ensure_traditional_in_obj(
+                safe_json_load((res or {}).get("response", "{}"))
+            )
 
         except Exception as e:
             if attempt < retries:
@@ -92,7 +133,7 @@ core_topics 請優先從下列主題中選 3~10 個：
 {", ".join(ALL_TOPICS_FOR_PROMPT)}
 
 內容：
-{text[:7000]}
+{_truncate(text, MAX_INGEST_CHARS, "")}
 
 JSON 格式：
 {{
@@ -256,14 +297,6 @@ def _normalize_contract_type_label(label: str) -> str:
 # RAG 檢索與關聯模板選擇
 
 def guess_draft_contract_type(draft_text: str) -> Dict[str, Any]:
-    """
-    判斷合約類型。
-
-    上線版設計：
-    1. 先用規則處理資訊系統建置、開發、維運這類企業常見混合型合約。
-    2. 規則無法判斷時才交給 LLM。
-    3. 避免「資訊系統建置與服務維運協議」被泛化成承攬合約。
-    """
     text = str(draft_text or "")
     mode = detect_contract_mode_from_text(text)
 
@@ -322,7 +355,6 @@ def guess_draft_contract_type(draft_text: str) -> Dict[str, Any]:
     has_maintain = any(k in normalized for k in ["維護", "維運", "保固", "修補", "故障排除", "技術支援", "服務維運"])
     has_security = any(k in normalized for k in ["資安", "弱點掃描", "弱點修補", "滲透測試", "資安檢測"])
 
-    # 資訊系統建置 + 維運：優先判定為混合型，但 primary 用開發合約，secondary 放維護合約
     if has_system and has_build and has_maintain:
         return {
             "primary_type": "開發合約",
@@ -512,14 +544,6 @@ def _sanitize_issues_for_article(
     article_key: str,
     fallback_index: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    將 LLM 產出的 issue 強制對齊目前審查的草稿條文。
-
-    目的：
-    1. 避免 LLM 把歷史基準條款名稱寫進 clause，造成「標題是維護人力，展開卻是爭議處置」的錯配。
-    2. 保留 LLM 的 issue_topic 作為風險主題，但 clause / draft_text / article_key 一律以目前草稿條文為準。
-    3. 若 LLM 回傳非 dict 或空內容，直接濾掉。
-    """
     if not isinstance(issues, list):
         return []
 
@@ -563,7 +587,6 @@ def _build_article_evidence_packet(
     article: Dict[str, Any],
     candidate_chunks: List[Dict[str, Any]],
 ) -> str:
-    """調查員階段：整理草稿條文與歷史 / 法遵依據成證據包。"""
     article_label = _article_display_label(article)
     article_content = _safe_str(article.get("content"))
     article_topics = "、".join([
@@ -613,7 +636,6 @@ def _has_strong_evidence_for_issue(
     article: Dict[str, Any],
     candidate_chunks: List[Dict[str, Any]],
 ) -> bool:
-    """沒有候選歷史片段，也沒有紅線字眼時，不要求 LLM 硬找問題。"""
     content = _safe_str(article.get("content"))
     if not content:
         return False
@@ -791,7 +813,6 @@ def select_review_templates(
 
     merged_candidates: Dict[str, Dict[str, Any]] = {}
 
-    # 依 primary + secondary 各自抓一輪
     for ctype in requested_types:
         hits = find_related_historical_templates(
             draft_text=draft_text,
@@ -808,7 +829,6 @@ def select_review_templates(
             if doc_id:
                 merged_candidates[doc_id] = item
 
-    # 若還是很少，再補全庫語意搜尋
     if not merged_candidates:
         logging.info("找不到結構化/語意歷史模板，退回全庫搜尋")
         fallback = query_templates_fulltext(draft_text, n_results=max(12, max_candidates)) or []
@@ -891,22 +911,22 @@ def build_target_queries(
     articles: List[Dict[str, Any]],
     selected_templates: List[Dict[str, Any]],
 ) -> List[str]:
-    queries = [draft_text[:1500]]
+
+    queries: List[str] = []
+    queries.append(_truncate(draft_text, MAX_QUERY_CHARS, ""))
+
     for article in articles:
         content = article.get("content", "")
-        queries.append(content[:700])
-        for topic in article.get("topics", []):
-            kw = " ".join(TOPIC_KEYWORDS.get(topic, [])[:5])
-            queries.append(f"{topic} {kw} {content[:240]}")
+        if not content:
+            continue
+        article_no = (article.get("article_no") or "").strip()
+        title = (article.get("title") or "").strip()
+        header = " ".join(x for x in [article_no, title] if x)
+        body = _truncate(content, 700, "")
+        q = f"{header} {body}".strip() if header else body
+        queries.append(q)
 
-    template_topics: set = set()
-    for t in selected_templates:
-        template_topics.update(t.get("core_topics", []))
-    for topic in template_topics:
-        kw = " ".join(TOPIC_KEYWORDS.get(topic, [])[:5])
-        queries.append(f"{topic} {kw}")
-
-    dedup = []
+    dedup: List[str] = []
     seen: set = set()
     for q in queries:
         q = normalize_text(q)
@@ -943,8 +963,6 @@ def search_relevant_templates(
 
     doc_ids = [x["doc_id"] for x in selected_templates if x.get("doc_id")]
 
-    # 從所有草稿條文中整理一組 fallback topics。
-    # 當單一 query 偵測不到 topic 時，仍可提供 RAG topic filter 使用。
     article_topic_fallbacks: List[str] = []
     for article in articles:
         for topic in article.get("topics", []) or []:
@@ -981,7 +999,6 @@ def search_relevant_templates(
                 seen.add(key)
                 all_chunks.append(r)
 
-    # selected_templates 保留全集供比對，但 LLM 僅餵前 top_k 個高相關模板摘要
     return selected_templates, all_chunks[:40], articles
 
 
@@ -1005,7 +1022,6 @@ def search_template_chunks_for_article(
     article_clause_type = _safe_str(article.get("clause_type"))
     header = " ".join(x for x in [article_no, article_title] if x)
 
-    # 本條款的主要 topic，會傳給 database.py 的 filter_chunks_by_topic()
     target_topic = article_topics[0] if article_topics else ""
     if not target_topic and article_clause_type:
         target_topic = normalize_topic_name(article_clause_type)
@@ -1044,7 +1060,6 @@ def search_template_chunks_for_article(
             "廣告", "文宣", "終止事由",
         ]
 
-        # 把本條 topic 的 keywords 放到最前面，提升同 topic chunk 排名
         for topic in article_topics:
             for term in TOPIC_KEYWORDS.get(topic, [])[:8]:
                 n_term = normalize_text(term)
@@ -1170,7 +1185,6 @@ def search_template_chunks_for_article(
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [x[1] for x in scored[:n_results]]
-# 風險卡片正規化：統一 LLM、紅線規則、缺漏條款等不同來源的欄位格式
 _LAW_REF_RE = re.compile(
     r"[\u4e00-\u9fa5]{1,24}法第\s*[\d一二三四五六七八九十百千]+條(?:之\d+)?(?:第[\d一二三四五六七八九十]+項)?"
 )
@@ -1376,335 +1390,32 @@ def build_trigger_issues_from_articles(
     articles: List[Dict[str, Any]],
     draft_type: str = "其他",
 ) -> List[Dict[str, Any]]:
-    """
-    deterministic 風險保底機制。
 
-    目的：
-    即使 LLM 沒有產生 major_issues / general_issues，
-    只要草稿條文命中 CRITICAL_RISK_TRIGGERS 或 HIGH_RISK_TRIGGERS，
-    系統仍會自動產生風險項目，避免高風險字眼被漏掉。
+    rules = load_rules()
+    if not rules:
+        logging.warning("Rule engine 載入 0 條規則 — 紅線保底層失效，請檢查 rules/ 目錄")
+        return []
 
-    這一層不取代 LLM，而是作為企業紅線規則保底。
-    """
-    issues: List[Dict[str, Any]] = []
-
-    # 依合約類型啟用對應規則，避免保險代理合約誤套開發 / 資安維護規則
     draft_type = _normalize_contract_type_label(draft_type)
-    enabled_topics = set(CONTRACT_TYPE_RULESET.get(draft_type, []))
 
-    # 額外保底字詞：避免 config.py 尚未補齊時漏抓
-    jurisdiction_triggers = [
-        "美國加州",
-        "美西",
-        "太平洋沿岸",
-        "州級",
-        "聯邦裁判機關",
-        "聯邦法院",
-        "外國法院",
-        "當地商業法規",
-        "適用當地",
-    ]
-
-    open_source_triggers = [
-        "公開原始碼",
-        "公開程式碼",
-        "公開技術文件",
-        "開源",
-        "上傳GitHub",
-        "上傳至GitHub",
-        "公眾可無償存取",
-        "雲端代碼儲存空間",
-        "不特定多數人查閱",
-        "查閱、複製與優化",
-    ]
-
-    abnormal_response_triggers = [
-        "兩個營業週期",
-        "三個太陽日",
-        "營業週期",
-        "太陽日",
-    ]
-
-    workforce_triggers = [
-        "見習",
-        "在學",
-        "建教",
-        "培訓專員",
-        "專案見習員",
-        "建教合作培訓專員",
-        "第一線專屬溝通橋樑",
-    ]
-
+    all_issues: List[Dict[str, Any]] = []
     for idx, article in enumerate(articles, start=1):
         content = str(article.get("content", "") or "").strip()
         if not content:
             continue
 
-        article_key = article_to_key(article, idx)
-        article_no = str(article.get("article_no", "") or "").strip()
-        article_title = str(article.get("title", "") or "").strip()
+        # 規則一次跑完，取得所有命中
+        hits = evaluate_all_rules(content, draft_type, rules=rules)
+        if not hits:
+            continue
 
-        if article_no and article_title:
-            clause_name = f"{article_no}：{article_title}"
-        elif article_no:
-            clause_name = article_no
-        elif article_title:
-            clause_name = article_title
-        else:
-            clause_name = f"第 {idx} 條"
+        # 每個命中組成一個 issue，後續合併
+        for hit in hits:
+            issue = render_issue_from_hit(hit, article, idx)
+            all_issues.append(issue)
 
-        triggered_by_topic: Dict[str, Dict[str, Any]] = {}
-
-        def _add_trigger(topic: str, risk: str, issue_type: str, matched: List[str]) -> None:
-            topic = normalize_topic_name(topic)
-            matched = [m for m in matched if m]
-            if not matched:
-                return
-
-            existing = triggered_by_topic.get(topic)
-
-            if existing:
-                existing["matched"] = list(
-                    dict.fromkeys(existing.get("matched", []) + matched)
-                )
-
-                if _risk_level_rank(risk) > _risk_level_rank(existing.get("risk")):
-                    existing["risk"] = risk
-                    existing["type"] = issue_type
-
-                if risk == "Critical":
-                    existing["type"] = "conflict"
-
-                return
-
-            triggered_by_topic[topic] = {
-                "risk": risk,
-                "type": issue_type,
-                "matched": list(dict.fromkeys(matched)),
-            }
-
-        # Critical triggers：依合約類型啟用對應規則
-        for topic, triggers in CRITICAL_RISK_TRIGGERS.items():
-            normalized_topic = normalize_topic_name(topic)
-
-            if enabled_topics and normalized_topic not in enabled_topics:
-                continue
-
-            matched = [t for t in triggers if t and t in content]
-            if matched:
-                _add_trigger(normalized_topic, "Critical", "conflict", matched)
-
-        # High triggers：依合約類型啟用對應規則
-        for topic, triggers in HIGH_RISK_TRIGGERS.items():
-            normalized_topic = normalize_topic_name(topic)
-
-            if enabled_topics and normalized_topic not in enabled_topics:
-                continue
-
-            matched = [t for t in triggers if t and t in content]
-            if matched:
-                _add_trigger(normalized_topic, "High", "deviation", matched)
-
-        # 額外保底：外國管轄 / 涉外準據法
-        matched_jurisdiction = [t for t in jurisdiction_triggers if t in content]
-        if matched_jurisdiction and (not enabled_topics or "管轄法院" in enabled_topics):
-            _add_trigger("管轄法院", "High", "deviation", matched_jurisdiction)
-
-        # 額外保底：公開、開源、上傳、不特定第三人存取
-        matched_open_source = [t for t in open_source_triggers if t in content]
-        if matched_open_source and (not enabled_topics or "保密與開源" in enabled_topics):
-            _add_trigger("保密與開源", "High", "deviation", matched_open_source)
-
-        # 額外保底：異常回覆時間過長或用語不明確
-        matched_abnormal_response = [t for t in abnormal_response_triggers if t in content]
-        if matched_abnormal_response and (not enabled_topics or "異常回覆時限" in enabled_topics):
-            _add_trigger("異常回覆時限", "High", "deviation", matched_abnormal_response)
-
-        # 額外保底：非正式維護 / 聯繫人力
-        matched_workforce = [t for t in workforce_triggers if t in content]
-        if matched_workforce:
-            has_maintenance_context = any(k in content for k in [
-                "維護", "維運", "故障", "技術支援", "服務支援", "工程師", "窗口", "第一線"
-            ])
-            has_dispute_context = any(k in content for k in [
-                "爭議", "協處", "裁判", "管轄", "法院", "準據法", "法律適用"
-            ])
-
-            trigger_topic = "維護人力" if has_maintenance_context and not has_dispute_context else "爭議處置"
-
-            if not enabled_topics or trigger_topic in enabled_topics:
-                _add_trigger(trigger_topic, "High", "deviation", matched_workforce)
-
-        for topic, payload in triggered_by_topic.items():
-            topic = normalize_topic_name(topic)
-            matched_words = list(dict.fromkeys(payload.get("matched", [])))
-            matched_text = "、".join(matched_words)
-
-            if topic == "資安檢測與掃描":
-                analysis = (
-                    f"本條出現「{matched_text}」等高風險字眼，顯示資安檢測、弱點掃描或修補責任可能被改為另行收費、"
-                    "由甲方負擔，或未被明確列為乙方義務，將增加甲方資安與合規風險。"
-                )
-                suggestion = (
-                    "建議明確約定乙方應配合資安檢測、弱點掃描與必要修補，並釐清費用是否已包含於合約價金內；"
-                    "若需另計費，應明訂範圍、上限與啟動條件。"
-                )
-                adjusted_clause = "乙方應配合甲方執行必要之資安檢測與弱點掃描，並依合約約定完成相關修補與回報。"
-
-            elif topic == "維護人力":
-                analysis = (
-                    f"本條出現「{matched_text}」等字眼，顯示乙方可能以見習、建教合作或非正式專業人員作為爭議協處、"
-                    "維護聯繫或第一線窗口，與企業對正式授權窗口、責任歸屬及專業支援之期待不符。"
-                )
-                suggestion = (
-                    "建議要求乙方指派具相關經驗與資格之正式工程師、專案經理或正式授權窗口負責協處與聯繫，"
-                    "並明確約定人員資格、替換機制與責任歸屬。"
-                )
-                adjusted_clause = "乙方應指派具相關經驗與資格之正式工程師、專案經理或授權窗口，負責本專案協處、聯繫與問題處理。"
-
-            elif topic == "爭議處置":
-                analysis = (
-                    f"本條出現「{matched_text}」等字眼，且該條內容涉及爭議協處、裁判機關或法律適用。"
-                    "若由見習、建教合作或非正式授權人員作為爭議協處窗口，可能導致協處權限不足、責任歸屬不明，"
-                    "並增加甲方後續爭議處理成本與程序不確定性。"
-                )
-                suggestion = (
-                    "建議明確約定爭議協處應由雙方正式授權代表、專案負責人或法務窗口處理，"
-                    "並另行約定第一審管轄法院與準據法，不宜以模糊地理範圍或非正式人員取代正式爭議處理機制。"
-                )
-                adjusted_clause = "雙方因本合約所生爭議，應先由雙方正式授權代表協商處理；協商不成時，依本合約約定之管轄法院及準據法處理。"
-
-            elif topic == "管轄法院":
-                analysis = (
-                    f"本條出現「{matched_text}」等涉外、非我方慣用管轄地或外國準據法相關字眼，"
-                    "並將第一審管轄機構指向外國州級或聯邦裁判機關，可能提高甲方爭議處理成本、法律適用不確定性及跨境訴訟負擔。"
-                )
-                suggestion = (
-                    "建議將第一審管轄法院調整為台灣台北地方法院，並明確約定準據法為中華民國法律；"
-                    "不得以模糊地理範圍或外國裁判機關取代明確管轄法院。"
-                )
-                adjusted_clause = "雙方同意因本合約所生之爭議，以台灣台北地方法院為第一審管轄法院，並以中華民國法律為準據法。"
-
-            elif topic == "違約金":
-                analysis = (
-                    f"本條出現「{matched_text}」等可能降低違約責任或設定過低上限之字眼，"
-                    "可能導致乙方遲延或違約時，甲方無法取得足夠補償。"
-                )
-                suggestion = "建議明確約定違約金計算方式、適用情境及合理上限，避免罰則過低而失去履約督促效果。"
-                adjusted_clause = "乙方如有遲延或違約情事，應依雙方約定之標準給付違約金。"
-
-            elif topic == "異常回覆時限":
-                analysis = (
-                    f"本條出現「{matched_text}」等不明確或過長的異常處理時限，"
-                    "可能導致系統發生中止、故障或服務阻礙時，乙方無法即時回應與排除問題，影響甲方營運穩定。"
-                )
-                suggestion = (
-                    "建議明確約定異常通報後之回覆時限、初步處理時間、修復時限與升級通報機制，"
-                    "避免使用營業週期、太陽日等不明確或不利於甲方的表述。"
-                )
-                adjusted_clause = "乙方應於接獲甲方異常通知後，依合約約定時限回覆處理進度，並持續追蹤至問題排除。"
-
-            elif topic == "保密與開源":
-                analysis = (
-                    f"本條出現「{matched_text}」等公開、上傳或開放存取相關字眼，"
-                    "表示乙方可能將專案產出、程式碼或技術模組提供予不特定第三人查閱、複製或優化。"
-                    "即使草稿稱其為非特定商業機密代碼，仍可能產生機密資訊外洩、智慧財產權歸屬不明與資安風險。"
-                )
-                suggestion = (
-                    "建議明確約定乙方未經甲方事前書面同意，不得公開、上傳、開源、揭露或提供任何涉及本專案之程式碼、"
-                    "系統架構、技術文件、資料集或衍生模組予第三人。"
-                )
-                adjusted_clause = "乙方未經甲方事前書面同意，不得公開、上傳、開源或提供任何涉及本專案之程式碼、系統架構、技術文件或資料予第三人。"
-
-            elif topic == "授權範圍":
-                analysis = (
-                    f"本條出現「{matched_text}」等字眼，表示乙方授權範圍可能過寬，或以口頭同意擴張保險代理服務事項。"
-                    "保險代理業務涉及高度監理，若未以書面明確約定授權事項，可能導致乙方越權招攬、承諾或處理保戶服務。"
-                )
-                suggestion = "建議明確限定乙方授權範圍，涉及新增服務、通路或合作事項時，均應取得甲方事前書面同意。"
-                adjusted_clause = "乙方辦理本合約以外之保險相關服務，應事前取得甲方書面同意，且不得逾越甲方明示授權範圍。"
-
-            elif topic == "文件轉送期限":
-                analysis = (
-                    f"本條出現「{matched_text}」等模糊期限，未明確規定乙方收受要保文件後應於幾日內轉送甲方。"
-                    "文件轉送延遲可能影響核保、出單、通報及保戶權益。"
-                )
-                suggestion = "建議將合理期間、儘速等文字改為明確日數，並約定資料不完整時的補正通知義務。"
-                adjusted_clause = "乙方應於收受客戶完整要保文件後三個工作日內轉送甲方核辦；如資料不全，應即時通知客戶補正。"
-
-            elif topic == "廣告文宣控管":
-                analysis = (
-                    f"本條出現「{matched_text}」等字眼，表示乙方可能未經甲方事前書面審核即先行使用廣告、簡報、社群貼文或商品文宣。"
-                    "保險商品招攬文宣涉及消費者保護與不實招攬風險，若僅採事後備查，將增加甲方遭主管機關裁罰或保戶爭議之風險。"
-                )
-                suggestion = "建議改為乙方製作或使用任何保險商品文宣、廣告、簡報、商品說明或社群內容前，均應先取得甲方書面同意。"
-                adjusted_clause = "乙方使用任何保險商品文宣、廣告、簡報、商品說明或社群內容前，應事先取得甲方書面同意後始得使用。"
-
-            elif topic == "個人資料保護":
-                analysis = (
-                    f"本條出現「{matched_text}」等字眼，顯示個人資料安全措施、事故通知期限或終止後資料返還刪除義務不夠明確。"
-                    "保險代理業務涉及保戶、要保人及被保險人資料，若僅約定合理安全措施，可能不足以支撐甲方監督與法遵要求。"
-                )
-                suggestion = "建議明確約定個資安全維護措施、事故通知期限、甲方監督權、資料返還與刪除義務。"
-                adjusted_clause = "乙方應依個人資料保護法及甲方要求採取安全維護措施；發生個資事件時，應立即通知甲方並配合補救，合約終止後應返還或刪除個人資料。"
-
-            elif topic == "複委託監督":
-                analysis = (
-                    f"本條出現「{matched_text}」等字眼，表示乙方可將資料處理、客服、行銷分析等作業交由合作廠商執行，"
-                    "但草稿未明確要求甲方事前書面同意、揭露複委託對象、監督受託者及承擔同等責任。"
-                )
-                suggestion = "建議要求乙方複委託前須取得甲方事前書面同意，並對受託者之行為負同等責任。"
-                adjusted_clause = "乙方如需複委託第三人處理本合約事項，應事前取得甲方書面同意，並確保受託者遵守本合約及相關法令，乙方並負同等責任。"
-
-            elif topic == "洗錢防制與打擊資恐":
-                analysis = (
-                    f"本條出現「{matched_text}」等模糊表述，表示乙方對客戶身分確認、風險辨識、資料補充及 AML/CFT 配合義務不足。"
-                    "保險業務涉及洗錢防制與打擊資恐監理要求，不能僅以一般商業慣例或合理範圍帶過。"
-                )
-                suggestion = "建議明確列入乙方應配合甲方辦理客戶身分確認、風險辨識、資料驗證、教育訓練及異常事項通報。"
-                adjusted_clause = "乙方應遵守洗錢防制及打擊資恐相關法令，並配合甲方辦理客戶身分確認、風險辨識、資料驗證及必要通報作業。"
-
-            elif topic == "終止事由":
-                analysis = (
-                    f"本條出現「{matched_text}」等模糊表述，表示甲方對乙方遭主管機關裁罰、證照撤銷、重大違法或保戶權益受損時的終止權不夠明確。"
-                    "保險代理合約若終止事由過於籠統，可能使甲方在監理事件發生後無法即時暫停或終止合作。"
-                )
-                suggestion = "建議明確列入證照撤銷、主管機關重大裁罰、重大違反保險法令、損害保戶權益及逾期未改善等終止事由。"
-                adjusted_clause = "乙方有證照撤銷、重大違反保險法令、遭主管機關重大裁罰或損害保戶權益情事時，甲方得暫停或終止本合約。"
-
-            elif topic == "損害賠償":
-                analysis = (
-                    f"本條出現「{matched_text}」等責任限制字眼，可能使乙方就個資外洩、不實招攬、挪用保費、主管機關裁罰或保戶損害之責任被過度限縮。"
-                    "保險代理業務涉及消費者保護與金融監理，損害賠償上限若過低，將降低甲方追償與風險控管能力。"
-                )
-                suggestion = "建議排除故意、重大過失、個資事件、違法招攬、挪用保費、主管機關裁罰及第三人求償等情形，不適用責任上限。"
-                adjusted_clause = "乙方因故意、重大過失、違法招攬、個資事件、挪用保費或主管機關裁罰所生損害，不適用賠償責任上限。"
-
-            else:
-                analysis = (
-                    f"本條出現「{matched_text}」等高風險字眼，可能與企業歷史合約慣例或法遵要求不一致，"
-                    "建議進一步確認其對甲方權益、履約責任及合規風險之影響。"
-                )
-                suggestion = "建議依企業歷史合約與法遵規範重新檢視本條，明確補足乙方義務、責任分配與違約效果。"
-                adjusted_clause = "建議依企業歷史合約基準補正本條乙方義務、責任分配與違約效果。"
-
-            issues.append({
-                "article_key": article_key,
-                "clause": clause_name,
-                "issue_topic": normalize_topic_name(topic),
-                "type": payload.get("type", "deviation"),
-                "risk": payload.get("risk", "High"),
-                "draft_text": content,
-                "template_basis": "系統企業紅線規則：CRITICAL_RISK_TRIGGERS / HIGH_RISK_TRIGGERS",
-                "template_snippet": f"命中風險字眼：{matched_text}",
-                "analysis": analysis,
-                "suggestion": suggestion,
-                "adjusted_clause": adjusted_clause,
-                "negotiation_notes": "最低底線：不得降低甲方法遵、保戶權益、個資保護、保密、爭議處理或違約救濟保障。",
-                "source": "系統內建企業紅線規則",
-            })
-
-    return issues
+    # 同一條文同 topic 合併（取最高 risk + 合併命中字眼）
+    return merge_issues_by_topic(all_issues)
 
 def llm_review_single_article(
     article: Dict[str, Any],
@@ -1720,12 +1431,14 @@ def llm_review_single_article(
         source_names.append(fname)
         topics = "、".join(_chunk_topics_list(c)) or "一般條款"
         label = _chunk_label(c)
+        # 截斷單個 chunk，避免長依據把 prompt 撐爆
+        snippet = _truncate(c["content"], MAX_CHUNK_CHARS)
         chunk_block.append(
             f"【依據 {i}】\n"
             f"對應主題：{topics}\n"
             f"檔名：{fname}\n"
             f"條文定位：{label}\n"
-            f"內容：{c['content']}"
+            f"內容：{snippet}"
         )
 
     allowed_sources = "、".join(sorted(set(source_names))) if source_names else "無"
@@ -1737,7 +1450,7 @@ def llm_review_single_article(
             "general_issues": [],
         }
 
-    draft_content = article.get("content", "")
+    draft_content = _truncate(article.get("content", ""), MAX_ARTICLE_CHARS)
     triggered_rules = []
 
     # 依合約類型啟用對應紅線規則
@@ -1841,7 +1554,7 @@ def llm_review_single_article(
 {evidence_packet}
 """
     logging.info(f"llm_review_single_article 使用模型：{REVIEW_MODEL}")
-    return ollama_json(prompt, model=REVIEW_MODEL)
+    return ollama_json(prompt, model=REVIEW_MODEL, num_ctx=LLM_NUM_CTX)
 
 
 def infer_missing_topics_from_templates(
@@ -1931,7 +1644,7 @@ def infer_missing_topics_from_templates(
         "廣告文宣控管",
         "佣酬返還",
         "理賠協助",
-        "法令遵循與合規",
+        "法規遵循與合規", 
         "個人資料保護",
         "複委託監督",
         "洗錢防制與打擊資恐",
@@ -3800,7 +3513,9 @@ def llm_chat(messages: List[Dict[str, str]], draft_text: str = "", review_contex
             },
         )
 
-        return res.get("message", {}).get("content", "系統無法產生回覆。")
+        return ensure_traditional(
+            res.get("message", {}).get("content", "系統無法產生回覆。")
+        )
 
     except Exception as e:
         logging.error(f"Ollama 對話失敗: {e}")

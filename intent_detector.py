@@ -13,18 +13,13 @@ IntentType = Literal[
 ]
 
 
-# ────────────────────────────────────────────────────────────
-# 關鍵字定義
-# ────────────────────────────────────────────────────────────
-
 _GENERATE_KEYWORDS = [
     "生成合約", "產生合約", "草擬合約", "寫一份合約",
     "幫我寫合約", "套版", "自動生成", "產出合約",
     "製作合約", "起草合約",
 ]
 
-# 修正①：補充 regex，解決「生成一份維護合約」被截斷的問題
-# 舊版只有精確字串匹配，「生成」和「合約」中間有其他字就漏掉
+
 _GENERATE_PATTERNS = [
     r"(生成|產生|草擬|起草|製作|產出|寫).{0,8}合約",
 ]
@@ -49,25 +44,22 @@ _LAW_KEYWORDS = [
     "金融監督", "個人資料保護法",
 ]
 
-# 強訊號：明確指向報價分析，幾乎不與合約審查衝突
+
 _PRICE_STRONG_KEYWORDS = [
     "報價", "太貴", "偏高", "偏低",
     "歷史價格", "採購金額", "這個價錢", "報價合理嗎",
     "報價風險",
 ]
 
-# 弱訊號：在「合約脈絡」下應讓位給 contract_review
+
 _PRICE_WEAK_KEYWORDS = ["價格", "金額", "費用", "合理嗎"]
 
-# 修正②：弱訊號消歧依據
-# 「費用條款合理嗎」→ contract_review；「台積電費用太高」→ price_risk
 _CONTRACT_CONTEXT_WORDS = [
     "條款", "合約", "契約", "草稿", "這份", "此份", "本合約",
     "審查", "缺漏", "約定", "補入", "加入", "那份",
     "原文", "內容", "甲方", "乙方", "丙方", "廠商",
 ]
 
-# 文件指向詞：只有使用者明確指向某份合約、條款或審查結果時，才使用合約審查上下文。
 _DOCUMENT_POINTER_WORDS = [
     "這份", "此份", "本合約", "這個合約", "這份合約",
     "草稿", "廠商草稿", "上傳", "剛剛那份", "剛才那份",
@@ -75,16 +67,13 @@ _DOCUMENT_POINTER_WORDS = [
     "甲方", "乙方", "丙方", "這條", "該條", "這一條",
 ]
 
-# 一般概念／方法論問題：優先排除，不進合約審查上下文。
 _GENERAL_EXPLANATION_PATTERNS = [
     r"(什麼是|是什麼|介紹|解釋|說明|定義).{0,20}(合約|契約|法遵|合規|資安|資訊安全|委外|個資|弱點掃描|弱掃|滲透測試)",
     r"(合約審查|法遵審查|合規檢查|資安檢測|弱點掃描|滲透測試).{0,12}(怎麼做|如何做|流程|架構|設計|原理|意思)",
     r"(請問|想問|我想知道).{0,20}(是什麼|什麼意思|怎麼定義|如何理解)",
 ]
 
-# 修正③：security_explanation 改用 regex 整句比對
-# 舊版只有固定字串，「請幫我說明一下弱點掃描」這類口語句無法識別
-# 新增 Pattern 4 涵蓋「說明/解釋/介紹 + 弱點掃描/資安」的各種句型
+
 _SECURITY_EXPLAIN_PATTERNS = [
     r"(什麼是|是什麼|介紹|解釋|說明).{0,10}(資安|資訊安全|資通安全)",
     r"(資安|弱掃|弱點掃描|滲透測試|iso\s*27001|soc\s*2).{0,8}(是什麼|什麼意思|怎麼定義|如何定義|指的是)",
@@ -94,9 +83,7 @@ _SECURITY_EXPLAIN_PATTERNS = [
 ]
 
 
-# ────────────────────────────────────────────────────────────
 # 工具函數
-# ────────────────────────────────────────────────────────────
 
 def _normalize(text: str) -> str:
     """小寫 + 移除空白，讓比對不受輸入格式影響。"""
@@ -108,22 +95,18 @@ def _has_any(text: str, keywords: List[str]) -> bool:
 
 
 def _has_contract_context(text: str) -> bool:
-    """是否帶有合約審查相關脈絡詞（用於弱訊號消歧）。"""
     return _has_any(text, _CONTRACT_CONTEXT_WORDS)
 
 
 def _has_document_pointer(text: str) -> bool:
-    """是否明確指向目前上傳／正在審查的合約、條款或審查結果。"""
     return _has_any(text, _DOCUMENT_POINTER_WORDS)
 
 
 def _is_general_explanation(text: str) -> bool:
-    """一般概念、方法論或定義型問題，不應直接進入合約審查上下文。"""
     return any(re.search(p, text) for p in _GENERAL_EXPLANATION_PATTERNS)
 
 
 def _is_generate_intent(text: str) -> bool:
-    """keyword 精確比對 + regex 補充識別，解決動詞與「合約」被其他詞截斷的問題。"""
     return (
         _has_any(text, _GENERATE_KEYWORDS)
         or any(re.search(p, text) for p in _GENERATE_PATTERNS)
@@ -131,33 +114,27 @@ def _is_generate_intent(text: str) -> bool:
 
 
 def _is_security_explanation(text: str) -> bool:
-    """整句 regex 比對，覆蓋多種口語問法。"""
     return any(re.search(p, text) for p in _SECURITY_EXPLAIN_PATTERNS)
 
 
-# ────────────────────────────────────────────────────────────
 # 主函數
-# ────────────────────────────────────────────────────────────
-
 def detect_intent(user_input: str) -> IntentType:
     text = _normalize(user_input)
 
     if not text:
         return "chat"
 
-    # ⓪ 一般概念／方法論問題優先排除。
-    # 例如：「弱點掃描是什麼？」「合約審查系統怎麼設計？」不應套用目前合約審查結果。
     if _is_security_explanation(text):
         return "security_explanation"
 
     if _is_general_explanation(text):
         return "chat"
 
-    # ① 合約生成（keyword 精確比對 + regex，幾乎不與其他 intent 衝突）
+    # ① 合約生成
     if _is_generate_intent(text):
         return "contract_generate"
 
-    # ② 歷史比對（帶有明確的比較語意）
+    # ② 歷史比對
     if _has_any(text, _HISTORICAL_KEYWORDS):
         return "historical_compare"
 
@@ -184,19 +161,13 @@ def detect_intent(user_input: str) -> IntentType:
 
 
 def detect_intents(user_input: str) -> List[IntentType]:
-    """
-    多意圖版本：回傳所有命中的 intent，按優先權排序。
 
-    用於「幫我審查這份合約，並比對跟舊版的差異」這類複合問題。
-    detect_intent() 只回傳第一個；未來若需要多步驟任務，
-    main.py 可改用此函數。
-    """
     text = _normalize(user_input)
 
     if not text:
         return ["chat"]
 
-    # 一般概念／方法論問題優先排除，避免因殘留 review_context 誤走審查流程。
+
     if _is_security_explanation(text):
         return ["security_explanation"]
 
@@ -216,7 +187,7 @@ def detect_intents(user_input: str) -> List[IntentType]:
     if _has_any(text, _REVIEW_KEYWORDS) and has_doc_context:
         results.append("contract_review")
     elif _has_any(text, _PRICE_WEAK_KEYWORDS) and has_doc_context:
-        # 弱訊號在合約脈絡下也補入 contract_review
+
         results.append("contract_review")
 
     if _has_any(text, _PRICE_STRONG_KEYWORDS) or (

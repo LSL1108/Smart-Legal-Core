@@ -27,10 +27,7 @@ def make_output_path(filename: str) -> str:
 
 
 def secure_filename(filename: str) -> str:
-    """
-    只保留英數字、中文字、點(.)、底線(_)和橫線(-)，
-    過濾掉如 ../ 等可能導致目錄穿越的危險符號。
-    """
+
     if not filename:
         return "unnamed_file"
     safe_name = re.sub(r'[^\w\u4e00-\u9fa5\.\-]', '_', filename)
@@ -67,21 +64,36 @@ def save_upload_file(up_file) -> Dict[str, Any]:
     }
 
 # 文本萃取工具
-def extract_text_from_pdf(file_or_path, max_pages: int = 30) -> str:
+def extract_text_from_pdf(file_or_path, max_pages: Optional[int] = None) -> str:
+
+    from config import MAX_PDF_PAGES
+    if max_pages is None:
+        max_pages = MAX_PDF_PAGES
+
     try:
-        reader = PdfReader(file_or_path)
-        texts  = [page.extract_text() or "" for page in reader.pages[:max_pages]]
-        return normalize_text("\n".join(texts))
+        reader = PdfReader(file_or_path, strict=False)
     except Exception as e:
-        logging.error(f"PDF 讀取失敗: {e}")
+        logging.error(f"PDF 開啟失敗: {e}")
         return ""
 
+    texts: List[str] = []
+    total = len(reader.pages)
+    for i, page in enumerate(reader.pages):
+        if i >= max_pages:
+            logging.warning(
+                f"PDF 超過 {max_pages} 頁（總計 {total} 頁），已截斷後續內容；"
+                f"如需處理更長文件，請調高 MAX_PDF_PAGES 環境變數。"
+            )
+            break
+        try:
+            texts.append(page.extract_text() or "")
+        except Exception as e:
+            logging.warning(f"PDF 第 {i + 1} 頁解析失敗，已 skip: {e}")
+            continue
+    return normalize_text("\n".join(texts))
+
 def extract_text_from_docx(file_or_path) -> str:
-    """
-    合約常以表格呈現條款（如 SLA、費用明細），原本只掃 paragraphs 會完全遺漏。
-    處理順序：先段落、再逐表格逐列逐格，確保順序貼近原文排版。
-    同時對每個 cell 做去重，避免合併儲存格造成重複文字。
-    """
+
     try:
         doc   = DocxReader(file_or_path)
         parts = []
@@ -156,11 +168,9 @@ def parse_template_selector(text: str) -> Dict[str, str]:
         return {"file_name": m.group(1).strip()}
     return {}
 
-# 條文感知切分與 chunking
-# 合約條文條號正則：支援中文數字、大寫中文數字與阿拉伯數字
+
 _ARTICLE_NUM_RE = r"[一二三四五六七八九十百千萬壹貳參肆伍陸柒捌玖拾0-9]+"
 
-# 只在行首辨識「第X條」，避免把「民法第184條」誤切成合約條款。
 ARTICLE_HEADER_RE = re.compile(
     rf"(?=(?:^|\n)\s*第\s*{_ARTICLE_NUM_RE}\s*條(?:[：:、\s]|$))",
     flags=re.M,
@@ -202,10 +212,7 @@ def _article_header_label(article_no: str, article_title: str = "") -> str:
     return ""
 
 def detect_topics_fast(text: str) -> List[str]:
-    """
-    便宜版 topic 偵測：先用關鍵字快速判斷，命中才直接回傳；
-    若沒有命中，再由 detect_topics 用 LLM 補強。
-    """
+
     text_n = normalize_text(text)
     if not text_n:
         return []
@@ -263,13 +270,7 @@ def _parse_article_block(raw: str, idx: int) -> Dict[str, Any]:
     }
 
 def chunk_text(text: str, chunk_size: int = 900, overlap: int = 120) -> List[Dict[str, Any]]:
-    """
-    合約專用 article-aware chunking：
-    1. 先按條文切分
-    2. 原則上一條一塊
-    3. 若單一條文過長，再切成子 chunk
-    4. 保留 article metadata，供後續檢索與引用
-    """
+
     articles = split_draft_into_articles(text)
     if not articles:
         return []
@@ -355,10 +356,7 @@ def detect_contract_mode_from_text(text: str) -> str:
     return active[0] if active else "其他"
 
 def detect_topics(text: str) -> List[str]:
-    """
-    LLM 語意分類器，加上嚴格 JSON 提取與防空值保護。
-    先走 fast path，減少不必要的模型呼叫。
-    """
+
     text = normalize_text(text)
     if not text or len(text) < 10:
         return []

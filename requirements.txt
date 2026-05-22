@@ -1,0 +1,40 @@
+# Smart Legal Core - Python dependencies
+# Tested with Python 3.10+
+
+# --- Core API & UI ---
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+streamlit>=1.30,<2.0
+pydantic>=2.5,<3.0
+requests>=2.31,<3.0
+
+# --- LLM & embeddings ---
+ollama>=0.3,<1.0
+
+# --- Vector DB ---
+chromadb>=0.4.22,<2.0
+
+# --- Document I/O ---
+pypdf>=4.0,<6.0
+python-docx>=1.1,<2.0
+docxtpl>=0.16,<1.0
+
+# --- Hybrid retrieval (BM25 + Chinese tokenization) ---
+# 若不安裝，系統會自動 degrade 回純 dense retrieval，但搜尋品質會明顯下降。
+rank_bm25>=0.2.2,<1.0
+jieba>=0.42,<1.0
+
+# --- Cross-encoder reranker（可選）---
+# 在 hybrid retrieval 之後再加一層精排，把 LLM 看到的 chunks 排序準確度推到最高。
+# 若不安裝，系統自動跳過 rerank step；ENABLE_RERANKER=false 也可手動關閉。
+# 注意：這會帶進 PyTorch (~2GB)。MacBook Air / Linux server 都跑得動，
+# Apple Silicon 會自動用 MPS 加速。
+sentence-transformers>=2.7,<5.0
+
+
+# --- Rule Engine（紅線檢核）---
+# 規則檔是 YAML 格式，必裝。
+pyyaml>=6.0,<7.0
+
+# 簡繁轉換（可選）— 沒裝的話正規化只做 NFKC + 大小寫，不會處理「網路 vs 网络」這類變體
+opencc-python-reimplemented>=0.1.7,<1.0

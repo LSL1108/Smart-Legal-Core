@@ -8,33 +8,76 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploaded_files")
 CHROMA_DIR = os.path.join(BASE_DIR, "chroma_db")
 SQLITE_DB_PATH = os.path.join(BASE_DIR, "contract_system.db")
+RETRIEVAL_CACHE_DIR = os.path.join(BASE_DIR, "retrieval_cache")
 
+
+# 🌐 Ollama 連線設定（可由環境變數覆寫）
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_EMBED_URL = f"{OLLAMA_URL}/api/embeddings"
 
 # 🧠 AI 模型設定
 # 保留 MODEL，避免舊程式引用時出錯
-MODEL = "qwen2.5:7b"
+MODEL = os.environ.get("MODEL", "qwen2.5:7b")
 
 # 一般聊天、概念解釋、/api/chat 使用較快模型，避免 timeout
-CHAT_MODEL = "qwen2.5:7b"
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen2.5:7b")
 
 # 合約逐條審查主流程使用較強模型
 # MacBook Air 若跑太慢，可以暫時改成 "qwen2.5:7b"
-REVIEW_MODEL = "qwen3.5:9b"
+REVIEW_MODEL = os.environ.get("REVIEW_MODEL", "qwen3.5:9b")
 
 # JSON 解析、metadata 抽取、意圖解析使用穩定小模型
-JSON_MODEL = "qwen2.5:7b"
+JSON_MODEL = os.environ.get("JSON_MODEL", "qwen2.5:7b")
 
 # Embedding 模型
-EMBED_MODEL = "bge-m3"
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
+
+
+# ⏱️ LLM 呼叫保護參數
+LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "16384"))
+
+LLM_TIMEOUT_SEC = float(os.environ.get("LLM_TIMEOUT_SEC", "180"))
+
+OLLAMA_MAX_CONCURRENCY = int(os.environ.get("OLLAMA_MAX_CONCURRENCY", "2"))
+
+
+MAX_ARTICLE_CHARS = int(os.environ.get("MAX_ARTICLE_CHARS", "3000"))
+MAX_CHUNK_CHARS = int(os.environ.get("MAX_CHUNK_CHARS", "800"))
+MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "12000"))
+MAX_QUERY_CHARS = int(os.environ.get("MAX_QUERY_CHARS", "1500"))
+MAX_INGEST_CHARS = int(os.environ.get("MAX_INGEST_CHARS", "12000"))
+MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "200"))
+
+
+RRF_K = int(os.environ.get("RRF_K", "60"))
+BM25_TOP_K = int(os.environ.get("BM25_TOP_K", "30"))
+DENSE_TOP_K = int(os.environ.get("DENSE_TOP_K", "30"))
+HYBRID_TOP_K = int(os.environ.get("HYBRID_TOP_K", "20"))
+
+
+ENABLE_RERANKER = os.environ.get("ENABLE_RERANKER", "true").lower() in ("true", "1", "yes")
+RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+
+RERANKER_INPUT_K = int(os.environ.get("RERANKER_INPUT_K", "8"))
+
+RERANKER_TOP_K = int(os.environ.get("RERANKER_TOP_K", "8"))
+
+RERANKER_TIMEOUT_SEC = float(os.environ.get("RERANKER_TIMEOUT_SEC", "30"))
+
+RERANKER_MAX_CHARS = int(os.environ.get("RERANKER_MAX_CHARS", "600"))
+
+
+ENABLE_SEMANTIC_TRIGGERS = os.environ.get(
+    "ENABLE_SEMANTIC_TRIGGERS", "true"
+).lower() in ("true", "1", "yes")
+SEMANTIC_MIN_CONTENT_CHARS = int(os.environ.get("SEMANTIC_MIN_CONTENT_CHARS", "50"))
 
 TOPIC_KEYWORDS = {
     "資安檢測與掃描": ["弱點掃描", "滲透測試", "源碼檢測", "資安控制", "修補漏洞", "資安規範", "系統掃描", "黑箱", "白箱", "惡意程式"],
     "法規遵循與合規": ["主管機關", "金融法規", "金管會", "合規", "稽核", "法遵", "金融保險業規範", "內部控制", "個資法"],
 
-    # 維護服務時段（星期幾、幾點到幾點）
     "維護時間": ["維護時間", "服務時間", "基本時間", "星期一", "週一", "週五", "9:00", "18:00"],
 
-    # 擴充：加入更多變形名詞，防止有心人士繞過
     "維護人力": [
         "人力配置", "資深工程師", "專責工程師", "專責窗口", "專員", 
         "實習生", "工讀生", "見習", "建教合作", "在學"
@@ -60,7 +103,6 @@ TOPIC_KEYWORDS = {
 
     "維護標的": ["維護標的", "本系統", "以下簡稱本系統"],
 
-    # 保險代理合約專用 topic
     "代理人資格": [
         "保險代理人執業證照", "適格代理人", "保險業務員證照",
         "未具保險業招攬人員資格", "保險代理人管理規則"
@@ -104,12 +146,11 @@ TOPIC_KEYWORDS = {
 }  
 
 TOPIC_MIN_MATCHES = {
-    # "維護人力": 2,  
+    "維護人力": 2,  
     "付款價金": 2,  
     "法規遵循與合規": 1, 
 }  
 
-# 負責將 LLM 生成的變體名稱正規化為標準的 Topic
 TOPIC_ALIAS = {
     "資安檢測與掃描": ["資安控制", "安全檢測", "漏洞掃描", "系統掃描", "安全性測試", "弱掃"],
     "法規遵循與合規": ["法規遵循", "金融保險業規範", "合規性", "主管機關要求", "法規配合"],
@@ -208,7 +249,6 @@ HIGH_RISK_TRIGGERS = {
         "太陽日",
     ],
 
-    # 保險代理合約高風險 trigger
     "授權範圍": [
         "口頭同意",
         "其他保險相關服務",
@@ -255,8 +295,7 @@ HIGH_RISK_TRIGGERS = {
     ],
 }
 
-# === Contract-type guarded rule sets ===
-# 用途：避免所有合約共用同一批 trigger，導致保險代理合約誤套開發 / 資安維護規則。
+
 CONTRACT_TYPE_RULESET = {
     "開發合約": {
         "資安檢測與掃描",
@@ -308,7 +347,7 @@ CONTRACT_TYPE_RULESET = {
         "廣告文宣控管",
         "佣酬返還",
         "理賠協助",
-        "法令遵循與合規",
+        "法規遵循與合規",  
         "個人資料保護",
         "複委託監督",
         "洗錢防制與打擊資恐",

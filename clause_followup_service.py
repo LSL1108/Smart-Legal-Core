@@ -131,13 +131,6 @@ def is_all_clause_request(user_input: str) -> bool:
 
 
 def is_all_missing_obligation_request(user_input: str) -> bool:
-    """
-    使用者問「所有缺漏義務條款」時，只列：
-    1. compliance_scan
-    2. missing_clauses
-
-    不列 major_issues / general_issues / gap_analysis。
-    """
     text = normalize_for_match(user_input)
 
     return (
@@ -148,10 +141,7 @@ def is_all_missing_obligation_request(user_input: str) -> bool:
 
 
 def is_all_revision_request(user_input: str) -> bool:
-    """
-    使用者問「所有建議修改條款 / 所有風險條款」時，
-    才把 major_issues / general_issues / gap_analysis 也列進來。
-    """
+
     text = normalize_for_match(user_input)
 
     return (
@@ -410,9 +400,6 @@ def select_clause_candidates(
     user_input: str,
     review_context: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """
-    選出最符合使用者需求的候選條文。
-    """
     include_issues = not is_all_missing_obligation_request(user_input)
     include_gap_analysis = not is_all_missing_obligation_request(user_input)
 
@@ -491,7 +478,6 @@ def build_clause_reminder(requirement: str) -> str:
 
 
 def sanitize_clause_text(requirement: str, clause_text: str) -> str:
-    """清理補條款回答，避免把審查中已被標示為風險的用語寫回合約。"""
     req_norm = normalize_for_match(requirement)
     text = clean_text(clause_text)
 
@@ -598,17 +584,7 @@ def answer_clause_followup_with_meta(
     user_input: str,
     review_context: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """
-    若 user_input 是「根據審查結果補條款」問題，回傳 dict。
-    若不是補條款問題，回傳 None。
 
-    回傳格式：
-    {
-        "reply": "...",
-        "tool_name": "clause_followup",
-        "extra": {...}
-    }
-    """
     if not is_clause_followup_request(user_input, has_review_context=bool(review_context)):
         return None
 
@@ -648,10 +624,7 @@ def answer_clause_followup(
     user_input: str,
     review_context: Dict[str, Any],
 ) -> Optional[str]:
-    """
-    舊版相容函式：
-    services.py 目前如果還是期待 str / None，可以繼續用這個。
-    """
+
     result = answer_clause_followup_with_meta(user_input, review_context)
 
     if result is None:

@@ -1,7 +1,6 @@
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 
 from services import llm_chat
@@ -20,7 +19,10 @@ def _is_timeout_exc(exc: BaseException) -> bool:
 
     module = getattr(type(exc), "__module__", "") or ""
     if any(m in module for m in ("ollama", "httpx", "requests", "urllib")):
-        return True
+        # 進一步檢查 message 是否包含 timeout 字樣，避免誤判其他 client 錯誤
+        msg = str(exc).lower()
+        if "timeout" in msg or "timed out" in msg:
+            return True
 
     return False
 
@@ -63,12 +65,14 @@ def answer_contract_chat(
         "extra": {...}
     }
 
-    設計重點：
-    1. 補條款問題優先由 clause_followup_service deterministic 處理。
-    2. 其他聊天才交給 llm_chat。
-    3. 統一提供 timeout、latency、tool_name、extra。
+    重要設計變更：
+    - 不再用 ThreadPoolExecutor.future.result(timeout=...) 假 timeout。
+      該方式無法 kill 已啟動的 worker thread，只是讓主執行緒提前回傳，
+      Ollama 那端的呼叫仍會繼續吃資源並阻塞下一個請求。
+    - 真正的 timeout 已下放到 ollama Client 層 (services._ollama_client)，
+      由 LLM_TIMEOUT_SEC 控制。client 在 HTTP 層丟 timeout exception 時
+      這裡只負責認得並轉成統一的回應格式。
     """
-    timeout_sec = float(os.getenv("CHAT_TIMEOUT_SEC", "120").strip() or "120")
     t0 = time.perf_counter()
 
     latest_user_input = _get_latest_user_input(messages)
@@ -82,6 +86,14 @@ def answer_contract_chat(
         "historical_compare",
     }
 
+    base_extra = {
+        "used_review_context": should_use_review_context,
+        "review_context_available": used_review_context,
+        "detected_intent": detected_intent,
+        "has_draft": has_draft,
+        "latest_user_input": latest_user_input[:200],
+    }
+
     if should_use_review_context:
         try:
             clause_result = answer_clause_followup_with_meta(
@@ -91,15 +103,7 @@ def answer_contract_chat(
 
             if clause_result:
                 extra = clause_result.get("extra") or {}
-                extra.update(
-                    {
-                        "used_review_context": should_use_review_context,
-                        "review_context_available": used_review_context,
-                        "detected_intent": detected_intent,
-                        "has_draft": has_draft,
-                        "latest_user_input": latest_user_input[:200],
-                    }
-                )
+                extra.update(base_extra)
 
                 return {
                     "reply": clause_result.get("reply", ""),
@@ -116,82 +120,43 @@ def answer_contract_chat(
         should_use_review_context=should_use_review_context,
     )
 
-    def _run():
-        return llm_chat(
+    try:
+        # 不再包 ThreadPoolExecutor — timeout 由 ollama Client 真正 enforce。
+        reply = llm_chat(
             messages=messages,
             draft_text=draft_text,
             review_context=review_context if should_use_review_context else None,
         )
 
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run)
-
-            try:
-                reply = future.result(timeout=timeout_sec)
-            except FuturesTimeoutError:
-                future.cancel()
-                logger.warning("llm_chat timed out after %.1fs", timeout_sec)
-
-                return {
-                    "reply": _TIMEOUT_MSG,
-                    "tool_name": "backend_timeout",
-                    "latency_sec": time.perf_counter() - t0,
-                    "extra": {
-                        "timed_out": True,
-                        "timeout_sec": timeout_sec,
-                        "used_review_context": should_use_review_context,
-                        "review_context_available": used_review_context,
-                        "detected_intent": detected_intent,
-                        "has_draft": has_draft,
-                        "latest_user_input": latest_user_input[:200],
-                    },
-                }
-
         return {
             "reply": reply,
             "tool_name": fallback_tool_name,
             "latency_sec": time.perf_counter() - t0,
-            "extra": {
-                "used_review_context": should_use_review_context,
-                "review_context_available": used_review_context,
-                "detected_intent": detected_intent,
-                "has_draft": has_draft,
-                "latest_user_input": latest_user_input[:200],
-            },
+            "extra": base_extra,
         }
 
     except Exception as exc:
         if _is_timeout_exc(exc):
-            logger.warning("llm_chat raised timeout exception: %s", exc)
+            logger.warning("llm_chat timed out at client layer: %s", exc)
+
+            timeout_extra = dict(base_extra)
+            timeout_extra["timed_out"] = True
 
             return {
                 "reply": _TIMEOUT_MSG,
                 "tool_name": "backend_timeout",
                 "latency_sec": time.perf_counter() - t0,
-                "extra": {
-                    "timed_out": True,
-                    "timeout_sec": timeout_sec,
-                    "used_review_context": should_use_review_context,
-                    "review_context_available": used_review_context,
-                    "detected_intent": detected_intent,
-                    "has_draft": has_draft,
-                    "latest_user_input": latest_user_input[:200],
-                },
+                "extra": timeout_extra,
             }
 
         logger.exception("answer_contract_chat failed")
+
+        error_extra = dict(base_extra)
+        error_extra["error"] = str(exc)
 
         return {
             "reply": f"對話服務發生錯誤：{exc}",
             "tool_name": "chat_error",
             "latency_sec": time.perf_counter() - t0,
-            "extra": {
-                "error": str(exc),
-                "used_review_context": should_use_review_context,
-                "review_context_available": used_review_context,
-                "detected_intent": detected_intent,
-                "has_draft": has_draft,
-                "latest_user_input": latest_user_input[:200],
-            },
+            "extra": error_extra,
         }
